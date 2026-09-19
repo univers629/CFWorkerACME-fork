@@ -44,12 +44,17 @@ jobs:
           AUTH_KEYS: fake-auth-keys
           DB_SOURCE: d1
         run: |
-          node scripts/gen-wrangler-config.mjs wrangler.action.ci.jsonc
+          # 第二个参数是密钥文件：敏感项不再进 wrangler 配置（否则会被 deploy 明文打印）
+          node scripts/gen-wrangler-config.mjs wrangler.action.ci.jsonc .deploy-secrets.ci.json
           node -e "
             const fs = require('fs');
             const cfg = JSON.parse(fs.readFileSync('wrangler.action.ci.jsonc', 'utf-8'));
+            const sec = JSON.parse(fs.readFileSync('.deploy-secrets.ci.json', 'utf-8'));
             if (cfg.name !== 'ci-check') throw new Error('NAME 占位符未生效');
-            if (cfg.vars.MAIL_KEYS !== 'fake\"key|with&specials$/') throw new Error('特殊字符被破坏: ' + cfg.vars.MAIL_KEYS);
+            // MAIL_KEYS 属敏感项：应进密钥文件，且绝不能出现在配置里。
+            // 同时验证特殊字符未被破坏（生成是 JSON 安全的，不走 sed）。
+            if ('MAIL_KEYS' in (cfg.vars ?? {})) throw new Error('敏感项 MAIL_KEYS 不应出现在 vars 中');
+            if (sec.MAIL_KEYS !== 'fake\"key|with&specials$/') throw new Error('特殊字符被破坏: ' + sec.MAIL_KEYS);
             if (cfg.d1_databases[0].database_id !== undefined) throw new Error('未提供 D1 ID 时不应写入 database_id');
             // D1 库名默认必须跟 Worker 同名，避免面板里分不清哪个库配哪个 Worker
             if (cfg.d1_databases[0].database_name !== 'ci-check') throw new Error('D1 库名未跟随 Worker 名: ' + cfg.d1_databases[0].database_name);
@@ -59,7 +64,7 @@ jobs:
           npx wrangler deploy --dry-run --outdir=./dist-dry-run -c wrangler.action.ci.jsonc
 
           # 显式指定库名时必须被尊重（沿用旧库 DB_CF 的场景）
-          D1_DATABASE_NAME=legacy-db node scripts/gen-wrangler-config.mjs wrangler.action.ci2.jsonc > /dev/null
+          D1_DATABASE_NAME=legacy-db node scripts/gen-wrangler-config.mjs wrangler.action.ci2.jsonc .deploy-secrets.ci2.json > /dev/null
           node -e "
             const cfg = JSON.parse(require('fs').readFileSync('wrangler.action.ci2.jsonc', 'utf-8'));
             if (cfg.d1_databases[0].database_name !== 'legacy-db') throw new Error('显式 D1_DATABASE_NAME 未生效');
