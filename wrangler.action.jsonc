@@ -1,0 +1,125 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // =====================================================================================
+  // GitHub Actions 部署模板（不要直接用它部署，也请不要把密钥写进这个文件）
+  // -------------------------------------------------------------------------------------
+  // 用法：
+  //   CI  → .github/workflows/deploy-cloudflare.yml 会用仓库 Secrets/Variables 替换 ${...}，
+  //         生成 wrangler.action.local.jsonc（已在 .gitignore 中忽略）后部署。
+  //   本地 → 设好环境变量后执行：
+  //         node scripts/gen-wrangler-config.mjs
+  //         npx wrangler deploy -c wrangler.action.local.jsonc
+  //
+  // 占位符规则（见 scripts/gen-wrangler-config.mjs）：
+  //   ${NAME}              留空时用默认值 cfworker-acme
+  //   ${D1_DATABASE_ID}    留空时：CI 会先查/建同名 D1；仍拿不到就交给 wrangler 自动创建
+  //   ${CUSTOM_DOMAIN}     留空时整段 routes 会被删掉（只在 workers.dev 上访问）
+  //   ${DB_SOURCE}         默认 d1；mysql / prisma 仅用于自托管
+  // =====================================================================================
+  "name": "${NAME}",
+  "main": "src/cfapp.ts",
+  // 兼容性日期：仓库里不能写未来日期，升级时手动改成「当天日期」。
+  "compatibility_date": "2026-09-19",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "DB_SOURCE": "${DB_SOURCE}",
+    "MAIL_KEYS": "${MAIL_KEYS}",
+    "MAIL_SEND": "${MAIL_SEND}",
+    "AUTH_KEYS": "${AUTH_KEYS}",
+    "SITE_KEYS": "${SITE_KEYS}",
+    "SITE_HOST": "${SITE_HOST}",
+    "SITE_TITLE": "${SITE_TITLE}",
+    "DCV_AGENT": "${DCV_AGENT}",
+    "DCV_EMAIL": "${DCV_EMAIL}",
+    "DCV_TOKEN": "${DCV_TOKEN}",
+    "DCV_ZONES": "${DCV_ZONES}",
+    "GTS_useIt": "${GTS_useIt}",
+    "GTS_keyMC": "${GTS_keyMC}",
+    "GTS_keyID": "${GTS_keyID}",
+    "GTS_KeyTS": "${GTS_KeyTS}",
+    "SSL_useIt": "${SSL_useIt}",
+    "SSL_keyMC": "${SSL_keyMC}",
+    "SSL_keyID": "${SSL_keyID}",
+    "SSL_KeyTS": "${SSL_KeyTS}",
+    "ZRO_useIt": "${ZRO_useIt}",
+    "ZRO_keyMC": "${ZRO_keyMC}",
+    "ZRO_keyID": "${ZRO_keyID}",
+    "ZRO_KeyTS": "${ZRO_KeyTS}"
+  },
+  // ===== 自定义域名（可选）=====
+  // CUSTOM_DOMAIN 为空时，生成配置时会删掉整段 routes。
+  "routes": [
+    {
+      "pattern": "${CUSTOM_DOMAIN}",
+      "custom_domain": true
+    }
+  ],
+  // ===== 静态资源（Workers 静态资源，替代已废弃的 Workers Sites）=====
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/bootstrap",
+      "/setup",
+      "/setup/*",
+      "/login",
+      "/login/*",
+      "/nonce",
+      "/nonce/*",
+      "/check",
+      "/check/*",
+      "/exits",
+      "/exits/*",
+      "/apply",
+      "/apply/*",
+      "/order",
+      "/order/*",
+      "/acmes",
+      "/acmes/*",
+      "/token",
+      "/token/*",
+      "/erase",
+      "/erase/*",
+      "/certs",
+      "/certs/*",
+      "/panel",
+      "/panel/*",
+      "/users",
+      "/users/*",
+      "/tests",
+      "/tests/*",
+      "/tasks",
+      "/tasks/*",
+      "/clean",
+      "/clean/*",
+      "/admin/*",
+      "/api/*",
+      "/account/*",
+      "/ca_zip/*",
+      "/ca_pfx/*"
+    ]
+  },
+  // ===== 数据库 =====
+  // 只声明 binding + database_name；database_id 由 CI 查/建后回填，拿不到就交给
+  // wrangler >= 4.45 的自动资源创建（默认开启）。
+  "d1_databases": [
+    {
+      "binding": "DB_CF",
+      "database_name": "${D1_DATABASE_NAME}",
+      "database_id": "${D1_DATABASE_ID}"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "upload_source_maps": true,
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  }
+}

@@ -75,6 +75,8 @@
 > 3. Cloudflare 面板里确认构建命令是 `npm run build`、部署命令是 `npx wrangler deploy`（默认值即如此）。
 >
 > ⚠️ 历史版本的 README 中按钮指向 `.../CFWorkerACMEs`（结尾多了一个 `s`），该仓库并不存在，点进去只会失败——现已修正为真实仓库。
+>
+> 💡 长期维护更推荐 **[GitHub Actions 自动部署](#-部署到-cloudflaregithub-actions-自动部署--推荐用于长期维护)**：密钥统一放在仓库 Secrets，push 即部署，还能自动建 D1 并验证初始化。
 
 由于腾讯云EdgeOne Pages目前尚且不支持D1数据库，如果使用腾讯云EdgeOne Pages部署，需要使用外部数据库，参考变量部分
 
@@ -112,6 +114,15 @@
 | **`src/basic.ts` 变量清理** | Node/Docker 模式原来只透传 16 个与证书毫无关系的云盘变量（onedrive/baiduyun/115…），现在改为透传真实变量，且 `MAIL_KEYS` 与 `OPLIST_MAIL_KEYS` 两种写法都识别 |
 | **`.env.example` 补全** | 原来是 0 字节空文件，现在给出完整变量模板（数据源/邮件/鉴权/DCV/CA 四组） |
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
+
+### 🤖 v2.3：内置 GitHub Actions 部署（参考 cloud-mail）
+
+| 新增 | 说明 |
+| :--- | :--- |
+| [`.github/workflows/deploy-cloudflare.yml`](.github/workflows/deploy-cloudflare.yml) | 仓库 Secrets/Variables → 构建 → 查/建 D1 → 部署 → `/bootstrap` 验证 `db_ok=true` → 部署摘要。没配令牌时自动跳过，不会给 push 挂红叉 |
+| [`wrangler.action.jsonc`](wrangler.action.jsonc) | 带 `${占位符}` 的部署模板，密钥不进仓库 |
+| [`scripts/gen-wrangler-config.mjs`](scripts/gen-wrangler-config.mjs) | JSON 安全的占位符替换（不像 `sed` 会被值里的 `&`、`\|`、`"` 破坏），只打印"是否已设置"、不打印密钥 |
+| `Build Check` 新增校验 | 每次 CI 都会用假值跑一遍模板生成 + `wrangler deploy --dry-run -c`，模板写错会立刻暴露 |
 
 
 ---
@@ -270,7 +281,51 @@ npm run deploy-cf:test
 > | `database_id ... is not a valid UUID` / `A D1 database with ID "<database-id>" was not found` | 配置里还是 `<database-id>` 占位符 | 删掉 `database_id` 让 wrangler 自动创建，或执行 `npx wrangler d1 create DB_CF` 后把真实 ID 填回 |
 > | 部署成功但页面白屏、`/assets/*.js` 404 | 前端没构建，`public/` 里是仓库中过期的 `index.html` | 确认构建命令包含 `npm run build` |
 
-#### ② 部署到 EdgeOne Pages
+#### ③ 部署到 Cloudflare（GitHub Actions 自动部署 ⭐ 推荐用于长期维护）
+
+思路参考 [maillab/cloud-mail](https://github.com/maillab/cloud-mail) 的 Action 部署方式（[官方文档](https://doc.skymail.ink/guide/action.html)）：
+**不用把仓库接到 Cloudflare，也不用在本地配 ~/.wrangler 凭据**——密钥存在仓库 Settings 里，每次 push 自动构建 + 部署。
+
+一次性准备：仓库 `Settings → Secrets and variables → Actions`
+
+| 名称 | 必需 | 用途 |
+| :--- | :---: | :--- |
+| `CLOUDFLARE_API_TOKEN` | ✅ | Cloudflare API 令牌，模板 `Edit Cloudflare Workers`，另加 `D1:Edit` |
+| `CLOUDFLARE_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（控制台右侧栏可复制） |
+| `MAIL_KEYS` / `MAIL_SEND` / `AUTH_KEYS` | ✅ | Resend 密钥 / 发件人 / 鉴权盐值 |
+| `DCV_AGENT` / `DCV_EMAIL` / `DCV_TOKEN` / `DCV_ZONES` | ✅ | DCV 自动验证代理（不填则只能手动加 DNS 记录） |
+| `NAME` | ❌ | Worker 名称，默认 `cfworker-acme` |
+| `D1_DATABASE_NAME` | ❌ | D1 库名，默认 `DB_CF`（**不要随意改，改了会换库**） |
+| `D1_DATABASE_ID` | ❌ | 不填则自动查同名库、没有就创建 |
+| `CUSTOM_DOMAIN` | ❌ | 用完自己的域名访问，例如 `acme.example.com` |
+| `SITE_HOST` / `SITE_TITLE` | ❌ | 站点域名与标题（影响邮件里的链接与页面标题） |
+| `GTS_*` / `SSL_*` / `ZRO_*` | ❌ | 各 CA 的 EAB 参数（`*_useIt` 填 `true` 表示启用） |
+
+> 条目可以放在 **Secrets** 或 **Variables** 里，两种都识别（敏感值建议用 Secrets）。
+> 没配 `CLOUDFLARE_API_TOKEN` 时工作流会**自动跳过**，不会给每次 push 挂红叉。
+
+然后：`Actions → 🚀 Deploy to Cloudflare Workers → Run workflow`
+（也可以在 `main` 分支上改动 `src/**`、`frontend/**`、`wrangler*.jsonc` 时自动触发。）
+
+工作流做了什么：预检凭据与变量 → `npm ci` → `npm run build` → 查/建 D1 → 用
+[`scripts/gen-wrangler-config.mjs`](scripts/gen-wrangler-config.mjs) 把密钥写进 `wrangler.action.jsonc` 模板生成部署配置
+（JSON 安全替换，不会被值里的 `&`、`|`、`"` 弄坏） → `wrangler deploy --dry-run` 预检 → 部署 → 请求 `/bootstrap` 确认 `db_ok=true`（首次请求会执行幂等迁移建表）→ 输出部署摘要。
+
+本地想用同一套配置部署（不经过 Actions）：
+
+```bash
+export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... MAIL_KEYS=... AUTH_KEYS=...
+node scripts/gen-wrangler-config.mjs            # 生成 wrangler.action.local.jsonc（已 gitignore）
+npx wrangler deploy -c wrangler.action.local.jsonc
+```
+
+| 部署方式 | 适合谁 | 密钥放哪 | 首次建库 |
+| :--- | :--- | :--- | :--- |
+| Deploy 按钮 / Workers Builds | 想点一下就跑起来 | CF 控制台 Variables | wrangler 自动创建 |
+| **GitHub Actions** | 长期维护、想 push 即上线 | 仓库 Secrets/Variables | 工作流自动查/建 |
+| 命令行 `npm run deploy` | 本地调试完直接发包 | 本地 `wrangler.jsonc` / `~/.wrangler` | wrangler 自动创建 |
+
+#### ④ 部署到 EdgeOne Pages
 
 ```bash
 # 需在末尾追加 EdgeOne Token
@@ -531,6 +586,7 @@ npm install --prefix frontend && npm run build
 - [acmesh-official/acme.sh](https://github.com/acmesh-official/acme.sh) — A pure Unix shell script implementing ACME client protocol
 - [publishlab/node-acme-client](https://github.com/publishlab/node-acme-client) — Simple and unopinionated ACME client for Node.js
 - [Hono](https://hono.dev/) — Ultrafast web framework for the Edges
+- [maillab/cloud-mail](https://github.com/maillab/cloud-mail) — GitHub Actions 自动部署 Cloudflare Workers 的流程（凭据校验 / 自动建 D1 / 部署后初始化）参考了它的实现
 
 ---
 

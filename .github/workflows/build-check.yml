@@ -33,6 +33,29 @@ jobs:
       - name: Wrangler dry-run
         run: npx wrangler deploy --dry-run --outdir=./dist-dry-run
 
+      # 校验 Actions 部署模板 + 生成脚本：模板改坏了、占位符漏了，这里就会红。
+      # 用假的密钥值跑一遍，验证生成出来的配置本身能通过 wrangler 校验。
+      - name: Check deploy template & generator
+        env:
+          NAME: ci-check
+          CUSTOM_DOMAIN: ci.example.com
+          MAIL_KEYS: 'fake"key|with&specials$/'  # 故意塞特殊字符，验证替换是 JSON 安全的
+          MAIL_SEND: 'CI <ci@example.com>'
+          AUTH_KEYS: fake-auth-keys
+          DB_SOURCE: d1
+        run: |
+          node scripts/gen-wrangler-config.mjs wrangler.action.ci.jsonc
+          node -e "
+            const fs = require('fs');
+            const cfg = JSON.parse(fs.readFileSync('wrangler.action.ci.jsonc', 'utf-8'));
+            if (cfg.name !== 'ci-check') throw new Error('NAME 占位符未生效');
+            if (cfg.vars.MAIL_KEYS !== 'fake\"key|with&specials$/') throw new Error('特殊字符被破坏: ' + cfg.vars.MAIL_KEYS);
+            if (cfg.d1_databases[0].database_id !== undefined) throw new Error('未提供 D1 ID 时不应写入 database_id');
+            if (!cfg.assets || !cfg.assets.run_worker_first.includes('/api/*')) throw new Error('assets 配置丢失');
+            console.log('部署模板与生成脚本校验通过 ✔');
+          "
+          npx wrangler deploy --dry-run --outdir=./dist-dry-run -c wrangler.action.ci.jsonc
+
       - name: Assert build output
         run: |
           test -f public/index.html || { echo "public/index.html 缺失"; exit 1; }

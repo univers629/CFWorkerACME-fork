@@ -1,0 +1,217 @@
+name: 🚀 Deploy to Cloudflare Workers
+
+# =============================================================================================
+# 用 GitHub Actions 直接把 Worker 部署到你的 Cloudflare 账号（不需要 Cloudflare 的 Git 集成）。
+# 参考 maillab/cloud-mail 的 Action 部署思路：仓库 Secrets/Variables → 生成 wrangler 配置 → 部署 → 初始化校验。
+#
+# 一次性准备（仓库 Settings → Secrets and variables → Actions）：
+#   必需：CLOUDFLARE_API_TOKEN（Workers Scripts:Edit / D1:Edit / Account Settings:Read）
+#         CLOUDFLARE_ACCOUNT_ID
+#   建议：MAIL_KEYS、MAIL_SEND、AUTH_KEYS、DCV_AGENT、DCV_EMAIL、DCV_TOKEN、DCV_ZONES
+#   可选：NAME（Worker 名，默认 cfworker-acme）、D1_DATABASE_NAME（默认 DB_CF）、
+#         D1_DATABASE_ID（不填则自动查/建）、CUSTOM_DOMAIN（绑定自定义域名）、
+#         SITE_HOST/SITE_TITLE、GTS_* / SSL_* / ZRO_* 各 CA 的 EAB 参数
+#   没配 CLOUDFLARE_API_TOKEN 时本工作流会自动跳过（不会给推送挂上红叉）。
+# =============================================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Worker 名称（留空 = 使用变量 NAME，默认 cfworker-acme）"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "frontend/**"
+      - "wrangler*.jsonc"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/gen-wrangler-config.mjs"
+      - ".github/workflows/deploy-cloudflare.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 🏗️ Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      NAME: ${{ inputs.name || vars.NAME || 'cfworker-acme' }}
+      D1_DATABASE_NAME: ${{ vars.D1_DATABASE_NAME || 'DB_CF' }}
+      D1_DATABASE_ID_INPUT: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
+      CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DB_SOURCE: d1
+      MAIL_KEYS: ${{ secrets.MAIL_KEYS || vars.MAIL_KEYS }}
+      MAIL_SEND: ${{ secrets.MAIL_SEND || vars.MAIL_SEND }}
+      AUTH_KEYS: ${{ secrets.AUTH_KEYS || vars.AUTH_KEYS }}
+      SITE_KEYS: ${{ secrets.SITE_KEYS || vars.SITE_KEYS }}
+      SITE_HOST: ${{ secrets.SITE_HOST || vars.SITE_HOST }}
+      SITE_TITLE: ${{ secrets.SITE_TITLE || vars.SITE_TITLE }}
+      DCV_AGENT: ${{ secrets.DCV_AGENT || vars.DCV_AGENT }}
+      DCV_EMAIL: ${{ secrets.DCV_EMAIL || vars.DCV_EMAIL }}
+      DCV_TOKEN: ${{ secrets.DCV_TOKEN || vars.DCV_TOKEN }}
+      DCV_ZONES: ${{ secrets.DCV_ZONES || vars.DCV_ZONES }}
+      GTS_useIt: ${{ secrets.GTS_useIt || vars.GTS_useIt }}
+      GTS_keyMC: ${{ secrets.GTS_keyMC || vars.GTS_keyMC }}
+      GTS_keyID: ${{ secrets.GTS_keyID || vars.GTS_keyID }}
+      GTS_KeyTS: ${{ secrets.GTS_KeyTS || vars.GTS_KeyTS }}
+      SSL_useIt: ${{ secrets.SSL_useIt || vars.SSL_useIt || 'true' }}
+      SSL_keyMC: ${{ secrets.SSL_keyMC || vars.SSL_keyMC }}
+      SSL_keyID: ${{ secrets.SSL_keyID || vars.SSL_keyID }}
+      SSL_KeyTS: ${{ secrets.SSL_KeyTS || vars.SSL_KeyTS }}
+      ZRO_useIt: ${{ secrets.ZRO_useIt || vars.ZRO_useIt || 'true' }}
+      ZRO_keyMC: ${{ secrets.ZRO_keyMC || vars.ZRO_keyMC }}
+      ZRO_keyID: ${{ secrets.ZRO_keyID || vars.ZRO_keyID }}
+      ZRO_KeyTS: ${{ secrets.ZRO_KeyTS || vars.ZRO_KeyTS }}
+
+    steps:
+      - name: ✅ 预检：凭据与变量
+        id: preflight
+        run: |
+          set -uo pipefail
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::notice::未配置 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID，跳过本次部署。"
+            echo "::notice::配置方法：仓库 Settings → Secrets and variables → Actions，详见 README「GitHub Actions 自动部署」。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          echo "Worker 名称：$NAME"
+          echo "D1 数据库名：$D1_DATABASE_NAME"
+          [ -n "${CUSTOM_DOMAIN:-}" ] && echo "自定义域名：$CUSTOM_DOMAIN" || echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
+
+          for key in MAIL_KEYS MAIL_SEND AUTH_KEYS DCV_AGENT DCV_EMAIL DCV_TOKEN DCV_ZONES; do
+            if [ -z "${!key:-}" ]; then
+              echo "::warning::变量 $key 为空，部署后对应功能（发信 / DCV 自动验证 / 登录鉴权）不可用"
+            fi
+          done
+
+      - name: 🚚 检出代码
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: ⚙️ 设置 Node.js
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: 📦 安装依赖（npm workspaces：根 + frontend）
+        if: steps.preflight.outputs.skip != 'true'
+        run: npm ci
+
+      - name: 🛠️ 构建前端（产物写入 public/）
+        if: steps.preflight.outputs.skip != 'true'
+        run: npm run build
+
+      - name: 🐬 准备 D1 数据库
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+
+          if [ -n "${D1_DATABASE_ID_INPUT:-}" ]; then
+            echo "D1_DATABASE_ID=$D1_DATABASE_ID_INPUT" >> "$GITHUB_ENV"
+            echo "✅ 使用 Secrets/Variables 中提供的 D1 ID（${D1_DATABASE_ID_INPUT:0:8}…）"
+            exit 0
+          fi
+
+          echo "🔍 查询账号下是否已有名为 $D1_DATABASE_NAME 的 D1 数据库…"
+          if ! npx wrangler d1 list --json > /tmp/d1.json 2>/tmp/d1.err; then
+            echo "::warning::无法列出 D1 数据库（$(tail -n 3 /tmp/d1.err | tr '\n' ' ')），改用 wrangler 自动资源创建（beta）"
+            exit 0
+          fi
+
+          D1_ID="$(jq -r --arg n "$D1_DATABASE_NAME" '.[] | select(.name == $n) | .uuid' /tmp/d1.json | head -n 1)"
+          if [ -z "$D1_ID" ] || [ "$D1_ID" = "null" ]; then
+            echo "⚠️ 未找到，创建 D1 数据库 $D1_DATABASE_NAME …"
+            npx wrangler d1 create "$D1_DATABASE_NAME" || true
+            npx wrangler d1 list --json > /tmp/d1.json 2>/dev/null || true
+            D1_ID="$(jq -r --arg n "$D1_DATABASE_NAME" '.[] | select(.name == $n) | .uuid' /tmp/d1.json 2>/dev/null | head -n 1)"
+          fi
+
+          if [ -n "$D1_ID" ] && [ "$D1_ID" != "null" ]; then
+            echo "D1_DATABASE_ID=$D1_ID" >> "$GITHUB_ENV"
+            echo "✅ 数据库就绪（${D1_ID:0:8}…），表结构由首次请求的幂等迁移自动创建"
+          else
+            echo "::warning::未能获取 D1 ID，交给 wrangler 自动创建（需要令牌有 D1 资源创建权限）"
+          fi
+
+      - name: 🧩 生成 wrangler 配置（注入 Secrets/Variables）
+        if: steps.preflight.outputs.skip != 'true'
+        run: node scripts/gen-wrangler-config.mjs wrangler.action.local.jsonc
+
+      - name: 🔎 部署前预检（wrangler deploy --dry-run）
+        if: steps.preflight.outputs.skip != 'true'
+        run: npx wrangler deploy --dry-run -c wrangler.action.local.jsonc
+
+      - name: 🚀 部署到 Cloudflare
+        id: deploy
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -o pipefail
+          npx wrangler deploy -c wrangler.action.local.jsonc 2>&1 | tee /tmp/deploy.log
+
+          WORKER_URL="$(grep -Eo 'https://[A-Za-z0-9._-]+\.workers\.dev' /tmp/deploy.log | head -n 1 || true)"
+          echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
+          echo "✅ 部署完成：${WORKER_URL:-（日志里未解析到 workers.dev 地址，请用 CUSTOM_DOMAIN 访问）}"
+
+      - name: ♻️ 初始化数据库（首次请求触发迁移）
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+
+          if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+            BASE_URL="https://$CUSTOM_DOMAIN"
+          else
+            BASE_URL="${{ steps.deploy.outputs.worker_url }}"
+          fi
+
+          if [ -z "$BASE_URL" ] || [ "$BASE_URL" = "https://" ]; then
+            echo "::warning::拿不到站点地址，跳过初始化校验。请手动打开站点确认（首次访问会自动建表）。"
+            exit 0
+          fi
+
+          echo "🌐 站点地址：$BASE_URL"
+          for i in $(seq 1 10); do
+            BODY="$(curl -sSL --max-time 20 "$BASE_URL/bootstrap" || true)"
+            if echo "$BODY" | jq -e '.db_ok == true' >/dev/null 2>&1; then
+              echo "✅ /bootstrap 返回 db_ok=true，数据库已就绪（首访初始化完成）"
+              exit 0
+            fi
+            echo "⏳ 第 $i 次等待站点就绪…（响应：$(echo "$BODY" | head -c 120)）"
+            sleep 6
+          done
+
+          echo "::warning::60 秒内未确认 db_ok=true。若绑定了 CUSTOM_DOMAIN，请确认域名已在这个 CF 账号下解析；否则直接打开站点访问一次即可建表。"
+
+      - name: 📋 部署摘要
+        if: always() && steps.preflight.outputs.skip != 'true'
+        run: |
+          {
+            echo "## 🚀 部署摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| :--- | :--- |"
+            echo "| Worker 名称 | \`$NAME\` |"
+            echo "| workers.dev | ${{ steps.deploy.outputs.worker_url || '（未解析到）' }} |"
+            echo "| 自定义域名 | ${CUSTOM_DOMAIN:-未设置} |"
+            echo "| D1 数据库 | \`$D1_DATABASE_NAME\` |"
+            echo "| 表结构 | 首次请求自动执行幂等迁移 |"
+            echo ""
+            echo "首次使用：打开站点进入 \`/setup\` 初始化向导，把管理员邮箱填成你自己的。"
+          } >> "$GITHUB_STEP_SUMMARY"
