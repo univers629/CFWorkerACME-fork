@@ -12,6 +12,7 @@
   //
   // 占位符规则（见 scripts/gen-wrangler-config.mjs）：
   //   ${NAME}              留空时用默认值 cfworker-acme
+  //   ${D1_DATABASE_NAME}  留空时 = 与 ${NAME}（Worker 名）同名，方便在面板里对号
   //   ${D1_DATABASE_ID}    留空时：CI 会先查/建同名 D1；仍拿不到就交给 wrangler 自动创建
   //   ${CUSTOM_DOMAIN}     留空时整段 routes 会被删掉（只在 workers.dev 上访问）
   //   ${DB_SOURCE}         默认 d1；mysql / prisma 仅用于自托管
@@ -103,8 +104,8 @@
     ]
   },
   // ===== 数据库 =====
-  // 只声明 binding + database_name；database_id 由 CI 查/建后回填，拿不到就交给
-  // wrangler >= 4.45 的自动资源创建（默认开启）。
+  // 只声明 binding + database_name（默认与 Worker 同名）；database_id 由 CI 查/建后回填，
+  // 拿不到就交给 wrangler >= 4.45 的自动资源创建（默认开启）。binding = DB_CF 是代码里用的名字，别改。
   "d1_databases": [
     {
       "binding": "DB_CF",

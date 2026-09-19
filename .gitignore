@@ -51,3 +51,4 @@ wrangler.oplists.jsonc
 wrangler.action.local.jsonc
 wrangler.action.ci.jsonc
 dist-dry-run/
+wrangler.action.ci2.jsonc

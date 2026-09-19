@@ -12,7 +12,7 @@
  *   默认输出 wrangler.action.local.jsonc（已 gitignore）
  *
  * 读取的环境变量：模板里出现的所有 ${XXX}，以及可选的默认值：
- *   NAME（默认 cfworker-acme）、D1_DATABASE_NAME（默认 DB_CF）、DB_SOURCE（默认 d1）
+ *   NAME（默认 cfworker-acme）、D1_DATABASE_NAME（默认 = NAME，即与 Worker 同名）、DB_SOURCE（默认 d1）
  *   D1_DATABASE_ID 为空 → 生成结果里不含 database_id（交给 wrangler 自动创建）
  *   CUSTOM_DOMAIN 为空 → 生成结果里不含 routes
  */
@@ -26,7 +26,6 @@ const TEMPLATE = resolve(ROOT, 'wrangler.action.jsonc');
 /** 留空时使用的默认值 */
 const DEFAULTS = {
     NAME: 'cfworker-acme',
-    D1_DATABASE_NAME: 'DB_CF',
     DB_SOURCE: 'd1',
 };
 
@@ -95,6 +94,8 @@ function main() {
     for (const [key, value] of Object.entries(process.env)) {
         if (value !== undefined && value !== '') env[key] = value;
     }
+    // 库名默认跟 Worker 同名：面板里 Worker 和 D1 一眼对得上号，不用猜哪个库配哪个 Worker。
+    env.D1_DATABASE_NAME = process.env.D1_DATABASE_NAME || env.NAME;
     // D1 ID 允许来自 D1_DATABASE_ID_INPUT（CI 里的原始输入）或已解析出的 D1_DATABASE_ID
     env.D1_DATABASE_ID = process.env.D1_DATABASE_ID || process.env.D1_DATABASE_ID_INPUT || '';
 

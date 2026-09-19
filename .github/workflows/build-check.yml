@@ -51,10 +51,20 @@ jobs:
             if (cfg.name !== 'ci-check') throw new Error('NAME 占位符未生效');
             if (cfg.vars.MAIL_KEYS !== 'fake\"key|with&specials$/') throw new Error('特殊字符被破坏: ' + cfg.vars.MAIL_KEYS);
             if (cfg.d1_databases[0].database_id !== undefined) throw new Error('未提供 D1 ID 时不应写入 database_id');
+            // D1 库名默认必须跟 Worker 同名，避免面板里分不清哪个库配哪个 Worker
+            if (cfg.d1_databases[0].database_name !== 'ci-check') throw new Error('D1 库名未跟随 Worker 名: ' + cfg.d1_databases[0].database_name);
             if (!cfg.assets || !cfg.assets.run_worker_first.includes('/api/*')) throw new Error('assets 配置丢失');
             console.log('部署模板与生成脚本校验通过 ✔');
           "
           npx wrangler deploy --dry-run --outdir=./dist-dry-run -c wrangler.action.ci.jsonc
+
+          # 显式指定库名时必须被尊重（沿用旧库 DB_CF 的场景）
+          D1_DATABASE_NAME=legacy-db node scripts/gen-wrangler-config.mjs wrangler.action.ci2.jsonc > /dev/null
+          node -e "
+            const cfg = JSON.parse(require('fs').readFileSync('wrangler.action.ci2.jsonc', 'utf-8'));
+            if (cfg.d1_databases[0].database_name !== 'legacy-db') throw new Error('显式 D1_DATABASE_NAME 未生效');
+            console.log('库名覆盖校验通过 ✔');
+          "
 
       - name: Assert build output
         run: |

@@ -8,7 +8,7 @@ name: 🚀 Deploy to Cloudflare Workers
 #   必需：CLOUDFLARE_API_TOKEN（Workers Scripts:Edit / D1:Edit / Account Settings:Read）
 #         CLOUDFLARE_ACCOUNT_ID
 #   建议：MAIL_KEYS、MAIL_SEND、AUTH_KEYS、DCV_AGENT、DCV_EMAIL、DCV_TOKEN、DCV_ZONES
-#   可选：NAME（Worker 名，默认 cfworker-acme）、D1_DATABASE_NAME（默认 DB_CF）、
+#   可选：NAME（Worker 名，默认 cfworker-acme）、D1_DATABASE_NAME（留空 = 与 Worker 同名，便于对号）、
 #         D1_DATABASE_ID（不填则自动查/建）、CUSTOM_DOMAIN（绑定自定义域名）、
 #         SITE_HOST/SITE_TITLE、GTS_* / SSL_* / ZRO_* 各 CA 的 EAB 参数
 #   没配 CLOUDFLARE_API_TOKEN 时本工作流会自动跳过（不会给推送挂上红叉）。
@@ -47,7 +47,8 @@ jobs:
 
     env:
       NAME: ${{ inputs.name || vars.NAME || 'cfworker-acme' }}
-      D1_DATABASE_NAME: ${{ vars.D1_DATABASE_NAME || 'DB_CF' }}
+      # 留空 = 与 Worker 同名（预检步骤里解析成 D1_DATABASE_NAME 传给后续步骤）
+      D1_DATABASE_NAME_INPUT: ${{ vars.D1_DATABASE_NAME }}
       D1_DATABASE_ID_INPUT: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
       CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -90,8 +91,10 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
+          # 库名默认与 Worker 同名：面板里 Worker 和 D1 一眼对得上号
+          echo "D1_DATABASE_NAME=${D1_DATABASE_NAME_INPUT:-$NAME}" >> "$GITHUB_ENV"
           echo "Worker 名称：$NAME"
-          echo "D1 数据库名：$D1_DATABASE_NAME"
+          echo "D1 数据库名：${D1_DATABASE_NAME_INPUT:-$NAME}"
           [ -n "${CUSTOM_DOMAIN:-}" ] && echo "自定义域名：$CUSTOM_DOMAIN" || echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
 
           for key in MAIL_KEYS MAIL_SEND AUTH_KEYS DCV_AGENT DCV_EMAIL DCV_TOKEN DCV_ZONES; do

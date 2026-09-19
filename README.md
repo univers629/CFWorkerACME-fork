@@ -213,8 +213,8 @@ npm install        # npm workspaces：根依赖 + frontend/ 前端依赖一次�
   // 不写 database_id：wrangler >= 4.45 会自动创建 D1 并把 ID 回填到配置里。
   "d1_databases": [
     {
-      "binding": "DB_CF",
-      "database_name": "DB_CF"
+      "binding": "DB_CF",              // 代码里用的名字（env.DB_CF），一般不用改
+      "database_name": "cfworker-acme" // 跟上面的 "name" 保持一致，面板里好对号
     }
   ],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
@@ -253,7 +253,8 @@ npm run deploy-cf
 npm run deploy-cf:test
 ```
 
-> ✅ **D1 数据库不需要手动创建**：`wrangler.jsonc` 里只写了 `binding` 和 `database_name`，
+> ✅ **D1 数据库不需要手动创建**：`wrangler.jsonc` 里只写了 `binding` 和 `database_name`
+> （默认 `cfworker-acme`，**与 Worker 同名**，在面板里一眼就能对上）：
 > wrangler ≥ 4.45 会在部署时自动创建数据库、回填 `database_id`（自动资源创建默认开启，可用 `--no-x-provision` 关闭）。
 > 表结构同样不用手动执行 `schema.set.sql`：首次请求会运行 `src/db/migrations` 里的幂等迁移。
 >
@@ -278,7 +279,7 @@ npm run deploy-cf:test
 > | :--- | :--- | :--- |
 > | `TS2307: Cannot find module 'antd' / 'zustand' / 'dayjs'` | 只装了根依赖，`frontend/` 的依赖没装 | 升级到 v2.1（npm workspaces）；或把安装命令改为 `npm install && npm --prefix frontend ci` |
 > | `TS5101: Option 'baseUrl' is deprecated` | 新版 TypeScript 把 `baseUrl` 列为废弃 | 升级到 v2.1；或给 `frontend/tsconfig.json` 加 `"ignoreDeprecations": "6.0"` 临时绕过 |
-> | `database_id ... is not a valid UUID` / `A D1 database with ID "<database-id>" was not found` | 配置里还是 `<database-id>` 占位符 | 删掉 `database_id` 让 wrangler 自动创建，或执行 `npx wrangler d1 create DB_CF` 后把真实 ID 填回 |
+> | `database_id ... is not a valid UUID` / `A D1 database with ID "<database-id>" was not found` | 配置里还是 `<database-id>` 占位符 | 删掉 `database_id` 让 wrangler 自动创建，或执行 `npx wrangler d1 create cfworker-acme` 后把真实 ID 填回 |
 > | 部署成功但页面白屏、`/assets/*.js` 404 | 前端没构建，`public/` 里是仓库中过期的 `index.html` | 确认构建命令包含 `npm run build` |
 
 #### ③ 部署到 Cloudflare（GitHub Actions 自动部署 ⭐ 推荐用于长期维护）
@@ -295,8 +296,8 @@ npm run deploy-cf:test
 | `MAIL_KEYS` / `MAIL_SEND` / `AUTH_KEYS` | ✅ | Resend 密钥 / 发件人 / 鉴权盐值 |
 | `DCV_AGENT` / `DCV_EMAIL` / `DCV_TOKEN` / `DCV_ZONES` | ✅ | DCV 自动验证代理（不填则只能手动加 DNS 记录） |
 | `NAME` | ❌ | Worker 名称，默认 `cfworker-acme` |
-| `D1_DATABASE_NAME` | ❌ | D1 库名，默认 `DB_CF`（**不要随意改，改了会换库**） |
-| `D1_DATABASE_ID` | ❌ | 不填则自动查同名库、没有就创建 |
+| `D1_DATABASE_NAME` | ❌ | D1 库名，**留空 = 与 `NAME`（Worker 名）同名**；只在想沿用已有库时才显式指定 |
+| `D1_DATABASE_ID` | ❌ | 已有库的 UUID，填了就直接用它（最稳妥，不会误建新库）；不填则自动查同名库、没有就创建 |
 | `CUSTOM_DOMAIN` | ❌ | 用完自己的域名访问，例如 `acme.example.com` |
 | `SITE_HOST` / `SITE_TITLE` | ❌ | 站点域名与标题（影响邮件里的链接与页面标题） |
 | `GTS_*` / `SSL_*` / `ZRO_*` | ❌ | 各 CA 的 EAB 参数（`*_useIt` 填 `true` 表示启用） |
@@ -390,7 +391,7 @@ docker run -d --name certhub -p 3000:3000 \
 | 变量 | 必填 | 默认值 | 说明 |
 | :--- | :--: | :--- | :--- |
 | `DB_SOURCE` | ✅ | `d1` | 数据源类型：`d1` / `mysql` / `prisma` |
-| `DB_CF` | △ | — | **Cloudflare D1 数据库绑定**（`DB_SOURCE=d1` 时必填，在 `wrangler.jsonc` 的 `d1_databases` 中配置） |
+| `DB_CF` | △ | — | **Cloudflare D1 数据库绑定名**（`DB_SOURCE=d1` 时必填，在 `wrangler.jsonc` 的 `d1_databases[0].binding` 里配置；这是**代码里用的变量名**，通常不用改） |
 | `DB_MYSQL_URL` | △ | — | **MySQL 完整连接串**（推荐），如 `mysql://user:pass@host:3306/db` |
 | `DB_MYSQL_HOST` | △ | — | MySQL 主机（未提供 `DB_MYSQL_URL` 时必填） |
 | `DB_MYSQL_PORT` | ❌ | `3306` | MySQL 端口 |
@@ -398,6 +399,14 @@ docker run -d --name certhub -p 3000:3000 \
 | `DB_MYSQL_PASS` | △ | — | MySQL 密码 |
 | `DB_MYSQL_NAME` | △ | — | MySQL 数据库名 |
 | `DATABASE_URL` | △ | — | **Prisma 数据库连接串**（`DB_SOURCE=prisma` 时使用） |
+
+> 📌 **D1 库名约定**：`database_name` 默认取成**和 Worker 同名**（默认都是 `cfworker-acme`），
+> 这样在 Cloudflare 面板的 Workers / D1 两个列表里能一眼对上，不会出现"这个库是给哪个 Worker 用的"。
+> - 想换个名字 → 改 `wrangler.jsonc` 的 `database_name`，或 Actions 里设变量 `D1_DATABASE_NAME`；
+> - 想改成别的 Worker 名 → 只改 `NAME`，库名会跟着走（Actions 路径）；
+> - ⚠️ **库名/ID 一旦定下来就不要改**：换了名字 wrangler 会去创建/使用另一个库，表现为"数据凭空没了"。
+>   已有数据要保留时，最稳的是把 `database_id` 直接填进配置（或设变量 `D1_DATABASE_ID`），
+>   而不是靠库名去猜——例如你之前用过旧名字 `DB_CF`，就把 `D1_DATABASE_NAME` 设成 `DB_CF` 继续用。
 
 > 💡 Cloudflare Workers 环境强烈建议使用 `d1`；自托管 / Docker 环境推荐 `mysql` 或 `prisma`。
 
@@ -563,7 +572,7 @@ location /acme/ {
 npm install --prefix frontend && npm run build
 ```
 
-并把 `wrangler.jsonc` 的 `database_id` 换成真实 ID（`npx wrangler d1 create DB_CF` 会打印）。
+并把 `wrangler.jsonc` 的 `database_id` 换成真实 ID（`npx wrangler d1 create cfworker-acme` 会打印）。
 
 </details>
 
