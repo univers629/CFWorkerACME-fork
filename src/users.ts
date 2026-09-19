@@ -217,6 +217,46 @@ export async function userRegs(c: Context) {
     if (Object.keys(user_data_db).length <= 0)
         return c.json({error: '请先发送邮件验证码'}, 200);
     let user_data_in: Record<string, any> = user_data_db[0]
+
+    // 注册策略二次校验（关键）==========================================================
+    // 说明：getNonce 在「发验证码」阶段已经拦过 REGISTER_ALLOW，但这里是真正写库的入口。
+    // 只要库里存在一条 flag=0 的待验证行（例如管理员是在用户点了「发送验证码」之后
+    // 才关闭注册的），攻击者就能拿着那串验证码直接调 /setup/ 完成注册，绕过开关。
+    // 因此必须在写库前再判一次，且只对「新注册」生效（flag=0）；
+    // 已注册用户（flag>=1）走的是重置密码流程，不受注册开关影响。
+    //
+    // 注意：邀请码（REGISTER_CODE）不在这里校验——前端 registerUser 不会把 invite
+    // 带到 /setup/，在这里判会误伤所有正常用户。邀请码作为「准入门槛」在发码阶段
+    // （getNonce）校验即可：拿不到验证码就走到不了这一步。
+    const isFresh = Number(user_data_in["flag"] ?? 0) === 0;
+    if (isFresh) {
+        try {
+            const {readBool} = await import("./db/conf");
+            const allow = await readBool(c.env as any, "REGISTER_ALLOW", true);
+            if (!allow) {
+                return c.json({flags: 1, texts: "当前站点未开放注册"}, 403);
+            }
+        } catch (e) {
+            console.error("[userRegs] read register policy failed:", e);
+            return c.json({flags: 1, texts: "系统暂时不可用，请稍后再试"}, 500);
+        }
+    }
+
+    // 验证码时效校验（关键）============================================================
+    // code 只在 5 分钟冷却窗口内有效；原实现没有任何过期判断，
+    // 意味着一条旧验证码可以永久重复使用（只要 pass 还没被设置）。
+    if (isFresh) {
+        const issuedAt = Number(user_data_in["time"] ?? 0);
+        const age = Date.now() - issuedAt;
+        const CODE_TTL_MS = 5 * 60 * 1000;
+        if (!issuedAt || age > CODE_TTL_MS || age < 0) {
+            try {
+                await delUsers(c, mail_data_in);
+            } catch {/* 清理失败不阻断错误返回 */}
+            return c.json({flags: 1, texts: "验证码已过期，请重新发送"}, 403);
+        }
+    }
+
     let code_hash_db = CryptoJS.SHA256(user_data_in["code"]).toString(CryptoJS.enc.Hex);
     let mail_data_db = CryptoJS.HmacSHA256(mail_data_in, code_hash_db) // 邮箱
     let mail_code_db = mail_data_db.toString(CryptoJS.enc.Hex);

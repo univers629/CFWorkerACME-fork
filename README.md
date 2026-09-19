@@ -115,6 +115,7 @@
 | **`.env.example` 补全** | 原来是 0 字节空文件，现在给出完整变量模板（数据源/邮件/鉴权/DCV/CA 四组） |
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
 | **`DCV_TOKEN` 只认 Global API Key** | `src/agent.ts` 固定发 `X-Auth-Email` + `X-Auth-Key`，填 scoped API Token 会报 `6003 Invalid request headers` | 改为按 token 形态自动选择鉴权头，两种凭证都能用（推荐 scoped Token，权限可限定到单个域名） |
+| **关闭注册后可被绕过** | `REGISTER_ALLOW=false` 只在「发验证码」阶段拦截；若库里已有 `flag=0` 的待验证行（管理员在用户点了发码之后才关闭注册），直接调 `/setup/` 仍能完成注册——实测复现 | 写库入口 `userRegs` 对新注册（`flag=0`）二次校验开关；同时补上验证码 5 分钟时效（原来旧验证码可永久复用） |
 
 ### 🤖 v2.3：内置 GitHub Actions 部署（参考 cloud-mail）
 
@@ -304,6 +305,9 @@ npm run deploy-cf:test
 | `SITE_HOST` / `SITE_TITLE` | ❌ | 站点域名与标题（影响邮件里的链接与页面标题） |
 | `GTS_*` / `SSL_*` / `ZRO_*` | ❌ | 各 CA 的 EAB 参数（`*_useIt` 填 `true` 表示启用） |
 
+> 条目可以放在 **Secrets** 或 **Variables** 里，两种都识别（敏感值建议用 Secrets）。
+> 没配 `CLOUDFLARE_API_TOKEN` 时工作流会**自动跳过**，不会给每次 push 挂红叉。
+
 #### 🔑 到底要准备几个令牌？
 
 | 令牌 | 数量 | 必需 | 说明 |
@@ -370,8 +374,21 @@ Cloudflare API Token 建议勾选（在 [API Tokens](https://dash.cloudflare.com
 > 想改这些配置不用重新部署：登录后进 **系统管理 → 配置**（`/admin/confs`），
 > 邮件、DCV、注册策略、CA 凭据都能在线改，改完立即生效。
 
-> 条目可以放在 **Secrets** 或 **Variables** 里，两种都识别（敏感值建议用 Secrets）。
-> 没配 `CLOUDFLARE_API_TOKEN` 时工作流会**自动跳过**，不会给每次 push 挂红叉。
+#### 🚫 关闭注册（防止陌生人白嫖）
+
+和 cloud-mail 的「网站设置 → 允许注册」开关等价，我们的实现在 **系统管理 → 配置 → 注册策略**：
+
+| 配置项 | 作用 |
+| :--- | :--- |
+| `REGISTER_ALLOW` | **关闭后登录页直接隐藏「注册」Tab**，后端发码与写库两处都会拒绝 |
+| `REGISTER_CODE` | 注册邀请码。留空=不校验；非空时必须在注册时填对（在发码阶段校验） |
+| `DEFAULT_QUOTA` | 新用户默认证书配额，`-1` 不限 |
+
+> ⚠️ **改动有最多 60 秒延迟**：配置读取有 60 秒内存缓存（`src/db/conf.ts` 的 `CACHE_TTL_MS`）。
+> 从管理页保存时会主动失效缓存，立即生效；直接改数据库则需要等缓存过期。
+>
+> 💡 想彻底关站（连注册入口都不留），关掉 `REGISTER_ALLOW` 后自己用管理员账号登录即可——
+> 管理员是初始化向导里创建的，不受注册开关影响。
 
 然后：`Actions → 🚀 Deploy to Cloudflare Workers → Run workflow`
 （也可以在 `main` 分支上改动 `src/**`、`frontend/**`、`wrangler*.jsonc` 时自动触发。）
