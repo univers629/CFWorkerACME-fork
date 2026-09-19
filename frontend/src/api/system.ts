@@ -32,6 +32,14 @@ export interface BootstrapInfo {
     provider: string;
     site_key: string;
   };
+  /**
+   * 初始化安全模式（后端返回）：
+   *   preset —— 已用 ADMIN_MAIL/ADMIN_PASS 自动建好管理员，向导不开放
+   *   token  —— 向导开放，但提交时必须带 SETUP_TOKEN
+   *   locked —— 未做任何安全配置，初始化接口拒绝服务
+   */
+  setup_mode?: 'preset' | 'token' | 'locked';
+  setup_error?: string;
 }
 
 /**
@@ -51,6 +59,8 @@ export interface SetupPayload {
   mail_enabled: boolean;
   mail_keys?: string;
   mail_send?: string;
+  /** 初始化令牌：仅当后端处于 token 模式时必填（对应环境变量 SETUP_TOKEN） */
+  setup_token?: string;
 }
 
 /** 提交初始化表单（只可调用一次） */

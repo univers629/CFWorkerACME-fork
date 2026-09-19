@@ -54,6 +54,11 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       DB_SOURCE: d1
+      # 初始化安全（防扫站抢注）：推荐配 ADMIN_MAIL + ADMIN_PASS（自动建号、向导不开放）；
+      # 只配 SETUP_TOKEN 则向导开放但需令牌；都不配则初始化接口拒绝服务（fail-closed）。
+      ADMIN_MAIL: ${{ secrets.ADMIN_MAIL || vars.ADMIN_MAIL }}
+      ADMIN_PASS_INPUT: ${{ secrets.ADMIN_PASS || vars.ADMIN_PASS }}
+      SETUP_TOKEN_INPUT: ${{ secrets.SETUP_TOKEN || vars.SETUP_TOKEN }}
       MAIL_KEYS: ${{ secrets.MAIL_KEYS || vars.MAIL_KEYS }}
       MAIL_SEND: ${{ secrets.MAIL_SEND || vars.MAIL_SEND }}
       AUTH_KEYS: ${{ secrets.AUTH_KEYS || vars.AUTH_KEYS }}
@@ -98,6 +103,13 @@ jobs:
           [ -n "${CUSTOM_DOMAIN:-}" ] && echo "自定义域名：$CUSTOM_DOMAIN" || echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
 
           # 这些不是「必需」，缺失只是功能不完整，所以只提示不阻断
+          if [ -z "${ADMIN_MAIL:-}" ] && [ -z "${ADMIN_PASS_INPUT:-}" ] && [ -z "${SETUP_TOKEN_INPUT:-}" ]; then
+            echo "::warning::未配置 ADMIN_MAIL+ADMIN_PASS 或 SETUP_TOKEN：站点初始化接口将拒绝服务（fail-closed）。"
+            echo "::warning::推荐配 ADMIN_MAIL(邮箱) + ADMIN_PASS(密码) —— 部署后自动创建管理员，初始化向导完全不暴露。"
+          elif [ -n "${ADMIN_PASS_INPUT:-}" ] && [ -z "${ADMIN_MAIL:-}" ]; then
+            echo "::warning::配了 ADMIN_PASS 但没有 ADMIN_MAIL，预置管理员不会生效（需要两者同时存在）。"
+          fi
+
           for key in MAIL_KEYS MAIL_SEND; do
             if [ -z "${!key:-}" ]; then
               echo "::warning::$key 为空：注册 / 找回密码要发邮箱验证码，不配就注册不了用户（也可以在站点 /setup 向导里填）"
@@ -182,6 +194,31 @@ jobs:
           echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
           echo "✅ 部署完成：${WORKER_URL:-（日志里未解析到 workers.dev 地址，请用 CUSTOM_DOMAIN 访问）}"
 
+      - name: 🔐 写入密钥（必须在首次部署之后：Worker 不存在时 secret put 会失败）
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+
+          # 用 secret put 而不是 vars：这些值不该出现在 wrangler 配置、仓库和部署日志里。
+          # --config 必须与部署用的一致，否则会写到别的 Worker 上。
+          put_secret() {
+            local key="$1" value="$2"
+            [ -z "$value" ] && return 0
+            if printf '%s' "$value" | npx wrangler secret put "$key" -c wrangler.action.local.jsonc > /tmp/secret.log 2>&1; then
+              echo "✅ 已写入密钥 $key"
+            else
+              echo "::error::写入密钥 $key 失败"; tail -n 5 /tmp/secret.log; exit 1
+            fi
+          }
+
+          put_secret ADMIN_PASS "$ADMIN_PASS_INPUT"
+          put_secret SETUP_TOKEN "$SETUP_TOKEN_INPUT"
+
+          # 两者都配时 preset 优先（预置管理员），SETUP_TOKEN 不生效
+          if [ -n "$ADMIN_PASS_INPUT" ] && [ -n "$SETUP_TOKEN_INPUT" ]; then
+            echo "::notice::同时配置了 ADMIN_PASS 与 SETUP_TOKEN，将以 preset（预置管理员）模式运行，向导不开放"
+          fi
+
       - name: ♻️ 初始化数据库（首次请求触发迁移）
         if: steps.preflight.outputs.skip != 'true'
         run: |
@@ -199,17 +236,47 @@ jobs:
           fi
 
           echo "🌐 站点地址：$BASE_URL"
+          READY=""
           for i in $(seq 1 10); do
             BODY="$(curl -sSL --max-time 20 "$BASE_URL/bootstrap" || true)"
             if echo "$BODY" | jq -e '.db_ok == true' >/dev/null 2>&1; then
               echo "✅ /bootstrap 返回 db_ok=true，数据库已就绪（首访初始化完成）"
-              exit 0
+              READY="$BODY"
+              break
             fi
             echo "⏳ 第 $i 次等待站点就绪…（响应：$(echo "$BODY" | head -c 120)）"
             sleep 6
           done
 
-          echo "::warning::60 秒内未确认 db_ok=true。若绑定了 CUSTOM_DOMAIN，请确认域名已在这个 CF 账号下解析；否则直接打开站点访问一次即可建表。"
+          if [ -z "$READY" ]; then
+            echo "::warning::60 秒内未确认 db_ok=true。若绑定了 CUSTOM_DOMAIN，请确认域名已在这个 CF 账号下解析；否则直接打开站点访问一次即可建表。"
+            exit 0
+          fi
+
+          # 初始化安全模式自检：把「有没有被扫站抢注的风险」直接暴露在 CI 里
+          MODE="$(echo "$READY" | jq -r '.setup_mode // "unknown"')"
+          INIT="$(echo "$READY" | jq -r '.initialized // false')"
+          case "$MODE" in
+            preset)
+              if [ "$INIT" = "true" ]; then
+                echo "✅ 初始化安全：preset —— 管理员已自动创建，初始化向导不对外开放"
+              else
+                echo "::error::preset 模式但未完成初始化，请检查 ADMIN_MAIL / ADMIN_PASS 是否合法"
+                echo "$READY" | jq -r '.setup_error // ""'
+                exit 1
+              fi
+              ;;
+            token)
+              echo "✅ 初始化安全：token —— 向导开放，但必须携带 SETUP_TOKEN"
+              ;;
+            locked)
+              echo "::warning::初始化安全：locked —— 站点尚未初始化，且未配置 ADMIN_MAIL+ADMIN_PASS / SETUP_TOKEN。"
+              echo "::warning::初始化接口已按 fail-closed 拒绝服务（不会被抢注），但你暂时也无法完成初始化，请补充配置后重跑。"
+              ;;
+            *)
+              echo "::warning::无法识别 setup_mode（$MODE），请确认部署的版本已包含初始化安全修复"
+              ;;
+          esac
 
       - name: 📋 部署摘要
         if: always() && steps.preflight.outputs.skip != 'true'

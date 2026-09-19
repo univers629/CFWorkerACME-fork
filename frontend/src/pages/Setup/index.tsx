@@ -10,6 +10,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Checkbox,
@@ -41,6 +42,8 @@ interface FormValues {
   mail_enabled: boolean;
   mail_keys?: string;
   mail_send?: string;
+  /** 初始化令牌：后端为 token 模式时必填 */
+  setup_token?: string;
 }
 
 function SetupPage() {
@@ -67,7 +70,15 @@ function SetupPage() {
   const dbOk = !!info?.db_ok;
   const dbSource = info?.db_source ?? 'unset';
   const dbErr = info?.db_error;
-  const canSubmit = useMemo(() => dbOk && !info?.initialized, [dbOk, info]);
+  // 初始化安全模式：preset（已预置，向导关闭）/ token（需令牌）/ locked（未配置）
+  const setupMode = info?.setup_mode ?? 'locked';
+  const needToken = setupMode === 'token';
+  const isLocked = setupMode === 'locked';
+  const isPreset = setupMode === 'preset';
+  const canSubmit = useMemo(
+    () => dbOk && !info?.initialized && !isLocked,
+    [dbOk, info, isLocked],
+  );
 
   const onSubmit = async (v: FormValues) => {
     if (!canSubmit) return;
@@ -91,6 +102,7 @@ function SetupPage() {
         mail_enabled: !!v.mail_enabled,
         mail_keys: v.mail_enabled ? v.mail_keys?.trim() : undefined,
         mail_send: v.mail_enabled ? v.mail_send?.trim() : undefined,
+        setup_token: needToken ? v.setup_token?.trim() : undefined,
       });
       if (resp && (resp as any).flags === 0) {
         message.success('系统初始化完成，即将跳转登录页');
@@ -168,6 +180,49 @@ function SetupPage() {
           )}
         </div>
 
+        {/* 安全模式提示 ==================================================== */}
+        {isLocked && (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="初始化向导未启用"
+            description={
+              <>
+                为防止站点被扫描后抢注管理员，初始化接口默认拒绝服务。请先在 Worker
+                的环境变量中配置 <code>ADMIN_MAIL</code> + <code>ADMIN_PASS</code>
+                （推荐，会自动建好管理员），或配置 <code>SETUP_TOKEN</code> 后重新部署。
+              </>
+            }
+          />
+        )}
+        {isPreset && !info?.initialized && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="正在按预置配置创建管理员"
+            description={
+              info?.setup_error
+                ? `自动初始化失败：${info.setup_error}`
+                : '已检测到 ADMIN_MAIL / ADMIN_PASS，系统会自动创建管理员，无需手动初始化。'
+            }
+          />
+        )}
+        {needToken && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="需要初始化令牌"
+            description={
+              <>
+                本次初始化必须填写环境变量 <code>SETUP_TOKEN</code> 的值，否则会被拒绝。
+              </>
+            }
+          />
+        )}
+
         {/* 表单 ========================================================== */}
         <Form<FormValues>
           form={form}
@@ -180,6 +235,16 @@ function SetupPage() {
           onFinish={onSubmit}
           disabled={!canSubmit || submitting}
         >
+          {needToken && (
+            <Form.Item
+              label="初始化令牌"
+              name="setup_token"
+              rules={[{ required: true, message: '请输入 SETUP_TOKEN' }]}
+              extra="对应部署时配置的环境变量 SETUP_TOKEN"
+            >
+              <Input.Password placeholder="SETUP_TOKEN" autoComplete="off" />
+            </Form.Item>
+          )}
           <Form.Item
             label="站点域名"
             name="site_host"

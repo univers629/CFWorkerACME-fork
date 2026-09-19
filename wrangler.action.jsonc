@@ -26,6 +26,11 @@
   ],
   "vars": {
     "DB_SOURCE": "${DB_SOURCE}",
+    // 初始化安全：ADMIN_MAIL 与 ADMIN_PASS 同时存在时，首次请求自动创建管理员，
+    // 初始化向导完全不开放（杜绝扫站抢注）。ADMIN_MAIL 不敏感，放这里即可；
+    // ADMIN_PASS / SETUP_TOKEN 属密钥，由工作流用 `wrangler secret put` 单独写入，
+    // 绝不进本文件（否则会随配置一起进仓库/日志）。
+    "ADMIN_MAIL": "${ADMIN_MAIL}",
     "MAIL_KEYS": "${MAIL_KEYS}",
     "MAIL_SEND": "${MAIL_SEND}",
     "AUTH_KEYS": "${AUTH_KEYS}",

@@ -53,11 +53,64 @@ export interface BootstrapResult {
         provider: string;
         site_key: string;
     };
+    /**
+     * 初始化安全模式：
+     *   preset —— 已用 ADMIN_MAIL/ADMIN_PASS 自动建好管理员，向导不开放
+     *   token  —— 向导开放，但提交时必须带 SETUP_TOKEN
+     *   locked —— 未做任何安全配置，初始化接口拒绝服务（默认态）
+     * 前端据此决定「显示向导 / 显示令牌输入框 / 显示未配置提示」。
+     */
+    setup_mode: SetupMode;
+    setup_error?: string;
 }
 
 /** SHA256 工具 */
 function sha256Hex(text: string): string {
     return CryptoJS.SHA256(text).toString(CryptoJS.enc.Hex);
+}
+
+/**
+ * 初始化安全模式
+ * -------------------------------------------------------------------------
+ * 背景：`/setup` 原先没有任何鉴权，只要站点还没初始化，任何人扫到域名都能
+ *       抢先 POST 一次把自己变成管理员（is_admin=1）并标记 INITIALIZED。
+ *       这是实打实的接管漏洞，必须 fail-closed。
+ *
+ * 三种模式（按优先级）：
+ *   preset —— 配了 ADMIN_MAIL + ADMIN_PASS：首次请求自动建管理员，
+ *             完全不暴露初始化向导（最安全，推荐）
+ *   token  —— 只配了 SETUP_TOKEN：向导可用，但必须带上这个令牌
+ *   locked —— 三者都没配：初始化接口直接拒绝（默认态，杜绝裸奔）
+ */
+export type SetupMode = "preset" | "token" | "locked";
+
+/** 判定当前处于哪种初始化模式 */
+export function resolveSetupMode(env: any): SetupMode {
+    const mail = String(env?.ADMIN_MAIL ?? "").trim();
+    const pass = String(env?.ADMIN_PASS ?? "").trim();
+    if (mail && pass) return "preset";
+    if (String(env?.SETUP_TOKEN ?? "").trim().length > 0) return "token";
+    return "locked";
+}
+
+/** 定长比较，避免通过响应时间猜测令牌 */
+function safeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+
+/**
+ * 归一化管理员密码：
+ *   - 64 位十六进制 → 视为已算好的 SHA256（便于脚本直接传哈希）
+ *   - 其余 → 按明文处理，计算 SHA256
+ * 登录逻辑比对的是 `HMAC(sha256(明文), code)`，所以库里必须存 sha256(明文) 的 hex。
+ */
+function normalizeAdminPass(raw: string): string {
+    const s = raw.trim();
+    if (/^[0-9a-fA-F]{64}$/.test(s)) return s.toLowerCase();
+    return sha256Hex(s);
 }
 
 /** 邮箱格式粗校验 */
@@ -102,6 +155,20 @@ export async function handleBootstrap(c: Context<AppEnv>): Promise<Response> {
         initialized = false;
     }
 
+    // 2.1) 预置管理员模式：首次访问就把管理员建好并标记初始化 ----------------
+    // 这样初始化向导永远不会暴露给访客（杜绝扫站抢注）。
+    const setupMode = resolveSetupMode(env);
+    let provisionError: string | undefined;
+    if (!initialized && dbOk && setupMode === "preset") {
+        const r = await ensureAdminProvisioned(env);
+        if (r.provisioned) {
+            initialized = true;
+        } else if (r.error) {
+            provisionError = r.error;
+            console.error("[bootstrap] 预置管理员初始化失败:", r.error);
+        }
+    }
+
     const siteTitle = (await safeRead(env, "SITE_TITLE")) ?? "SSL 证书助手";
     const siteHost = (await safeRead(env, "SITE_HOST")) ?? "";
     const mailEnabled = await safeReadBool(env, "MAIL_ENABLED", false);
@@ -136,6 +203,8 @@ export async function handleBootstrap(c: Context<AppEnv>): Promise<Response> {
             provider: captchaProvider,
             site_key: captchaSiteKey,
         },
+        setup_mode: setupMode,
+        setup_error: provisionError,
     };
     return c.json(payload, 200);
 }
@@ -145,6 +214,106 @@ async function safeRead(env: any, name: string): Promise<string | null> {
         return await readConf(env, name);
     } catch {
         return null;
+    }
+}
+
+/**
+ * 预置管理员自动初始化（mode = preset）
+ * -------------------------------------------------------------------------
+ * 幂等：已初始化则直接返回，不覆盖既有管理员密码。
+ * 由 handleBootstrap 在首次页面加载时调用，因此站点一起来就是「已初始化」状态，
+ * 初始化向导根本不会出现在访客面前。
+ */
+export async function ensureAdminProvisioned(env: any): Promise<{ provisioned: boolean; error?: string }> {
+    if (resolveSetupMode(env) !== "preset") return {provisioned: false};
+
+    // 已初始化 → 不碰
+    try {
+        if (await readBool(env, "INITIALIZED", false)) return {provisioned: false};
+    } catch {
+        return {provisioned: false, error: "读取初始化标记失败"};
+    }
+
+    const mail = String(env.ADMIN_MAIL ?? "").trim().toLowerCase();
+    if (!isValidEmail(mail)) {
+        return {provisioned: false, error: "ADMIN_MAIL 不是合法邮箱"};
+    }
+    const passHash = normalizeAdminPass(String(env.ADMIN_PASS ?? ""));
+    if (passHash.length !== 64) {
+        return {provisioned: false, error: "ADMIN_PASS 无效"};
+    }
+
+    try {
+        const dao = await ensureDao(env);
+        await upsertAdminUser(dao, mail, passHash);
+
+        // 站点基础信息：env 里配了就用，否则留空让管理员登录后自行设置
+        await writeConf(env, "ADMIN_MAIL", mail);
+        const siteHost = String(env.SITE_HOST ?? "").trim();
+        if (siteHost) await writeConf(env, "SITE_HOST", siteHost);
+        const siteTitle = String(env.SITE_TITLE ?? "").trim();
+        if (siteTitle) await writeConf(env, "SITE_TITLE", siteTitle);
+
+        // 把 env 中已配置的功能性变量一次性播种到 Confs（管理员后续可在线改）
+        await seedConfsFromEnv(env);
+
+        await writeConf(env, "INITIALIZED", "true");
+        console.log(`[setup] 已按预置配置自动创建管理员：${mail}`);
+        return {provisioned: true};
+    } catch (e: any) {
+        console.error("[setup] 预置管理员自动初始化失败:", e);
+        return {provisioned: false, error: e?.message ?? String(e)};
+    }
+}
+
+/** 从 env 播种功能性配置到 Confs（已存在的键不覆盖） */
+async function seedConfsFromEnv(env: any): Promise<void> {
+    const ENV_SEEDS: string[] = [
+        "MAIL_KEYS", "MAIL_SEND", "AUTH_KEYS", "SITE_KEYS",
+        "DCV_AGENT", "DCV_EMAIL", "DCV_TOKEN", "DCV_ZONES",
+        "GTS_useIt", "GTS_keyMC", "GTS_keyID", "GTS_KeyTS",
+        "SSL_useIt", "SSL_keyMC", "SSL_keyID", "SSL_KeyTS",
+        "ZRO_useIt", "ZRO_keyMC", "ZRO_keyID", "ZRO_KeyTS",
+    ];
+    for (const key of ENV_SEEDS) {
+        const raw = env?.[key];
+        if (typeof raw === "string" && raw.length > 0) {
+            await writeConf(env, key, raw);
+        }
+    }
+}
+
+/** 创建或升级管理员账号（两个初始化入口共用） */
+async function upsertAdminUser(
+    dao: Awaited<ReturnType<typeof ensureDao>>,
+    mail: string,
+    passHash: string
+): Promise<void> {
+    const existing = await dao.getUser(mail);
+    if (existing) {
+        // 升级既有账号为管理员；仅当原先未持有 ACME 私钥时补一条，避免覆盖
+        // 用户在普通注册流程里已经生成的账户密钥，导致 ACME 侧账户对应关系丢失。
+        const keepKeys = typeof existing.keys === "string" && existing.keys.length > 0;
+        const patch: Record<string, any> = {
+            flag: "1",
+            is_admin: 1,
+            pass: passHash,
+            quota: -1,
+            time: Date.now(),
+        };
+        if (!keepKeys) patch.keys = createAcmeAccountKeyPem();
+        await dao.updateUser(mail, patch);
+    } else {
+        await dao.insertUser({
+            mail,
+            flag: "1",
+            is_admin: 1,
+            pass: passHash,
+            quota: -1,
+            keys: createAcmeAccountKeyPem(),
+            apis: randomToken(16),
+            time: Date.now(),
+        });
     }
 }
 
@@ -191,11 +360,50 @@ export async function handleSetup(c: Context<AppEnv>): Promise<Response> {
         return c.json({flags: 3, texts: "系统已初始化，无法重复执行"}, 409);
     }
 
-    // 3) 读取 body -----------------------------------------------------------
-    let body: any;
+    // 2.05) 提前解析请求体 ---------------------------------------------------
+    // 安全校验需要读 setup_token，因此必须早于鉴权读取；这里解析失败不再直接返回，
+    // 由后续统一给出 400（保持原有错误语义）。
+    let body: any = null;
     try {
         body = await c.req.json();
     } catch {
+        body = null;
+    }
+
+    // 2.1) 初始化安全校验（关键）----------------------------------------------
+    // 修复「扫到未初始化站点即可抢注管理员」的接管漏洞：
+    //   preset —— 管理员已由预置配置自动创建，向导关闭
+    //   locked —— 未配置任何安全项，直接拒绝（fail-closed）
+    //   token  —— 必须提供与 SETUP_TOKEN 一致的令牌
+    const mode = resolveSetupMode(env);
+    if (mode === "preset") {
+        // 正常情况下 bootstrap 已经建好管理员；走到这里说明建号失败或并发，
+        // 无论哪种都不该再让匿名请求通过。
+        const r = await ensureAdminProvisioned(env);
+        if (r.provisioned) {
+            return c.json({flags: 3, texts: "系统已按预置配置完成初始化，请直接登录"}, 409);
+        }
+        return c.json(
+            {flags: 9, texts: "初始化向导已关闭（已配置 ADMIN_MAIL/ADMIN_PASS）。若管理员未能自动创建，请检查配置或日志。"},
+            403
+        );
+    }
+    if (mode === "locked") {
+        return c.json(
+            {flags: 9, texts: "初始化向导未启用：请先配置 ADMIN_MAIL + ADMIN_PASS（推荐）或 SETUP_TOKEN 后再访问。"},
+            403
+        );
+    }
+    // mode === "token"
+    const provided = String(body?.setup_token ?? c.req.header("X-Setup-Token") ?? "").trim();
+    const expected = String(env.SETUP_TOKEN ?? "").trim();
+    if (!provided || !safeEqual(provided, expected)) {
+        console.warn("[setup] 初始化令牌校验失败", {hasProvided: !!provided});
+        return c.json({flags: 9, texts: "初始化令牌无效"}, 403);
+    }
+
+    // 3) 读取 body（已在 2.05 解析）-------------------------------------------
+    if (!body || typeof body !== "object") {
         return c.json({flags: 4, texts: "请求体不是合法的 JSON"}, 400);
     }
     const siteHost = String(body.site_host ?? "").trim();
@@ -262,37 +470,8 @@ export async function handleSetup(c: Context<AppEnv>): Promise<Response> {
         }
 
         // 6) 创建或升级管理员账号 --------------------------------------------
-        // 密码存 SHA256（前端已做）；这里二次 SHA256 以与现有 userPost 一致。
-        // 现有登录逻辑使用 `user_data_in['pass']`（即 SHA256(明文) 的十六进制）。
-        const passStored = adminPass; // 前端已传入 SHA256
-        const existing = await dao.getUser(adminMail);
-        if (existing) {
-            // 升级既有账号为管理员；仅当原先未持有 ACME 私钥时补一条，避免覆盖
-            // 用户在普通注册流程里已经生成的账户密钥，导致 ACME 侧账户对应关系丢失。
-            const keepKeys = typeof existing.keys === "string" && existing.keys.length > 0;
-            const patch: Record<string, any> = {
-                flag: "1",
-                is_admin: 1,
-                pass: passStored,
-                quota: -1,
-                time: Date.now(),
-            };
-            if (!keepKeys) {
-                patch.keys = createAcmeAccountKeyPem();
-            }
-            await dao.updateUser(adminMail, patch);
-        } else {
-            await dao.insertUser({
-                mail: adminMail,
-                flag: "1",
-                is_admin: 1,
-                pass: passStored,
-                quota: -1,
-                keys: createAcmeAccountKeyPem(),
-                apis: randomToken(16),
-                time: Date.now(),
-            });
-        }
+        // 密码存 SHA256（前端已做）；与登录逻辑比对的口径保持一致。
+        await upsertAdminUser(dao, adminMail, adminPass);
 
         // 7) 最后置初始化标记 -----------------------------------------------
         await writeConf(env, "INITIALIZED", "true");

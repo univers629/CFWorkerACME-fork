@@ -118,6 +118,19 @@ function main() {
         delete config.routes;
     }
 
+    // vars 里的空字符串要删掉，原因有两个：
+    //   1) 空的 vars 会以 "" 覆盖掉同名 secret（wrangler 部署时报重复绑定错误）；
+    //   2) 未配置的项留空没有意义，反而在 CF 控制台里造成"已配置"的错觉。
+    const emptyVars = [];
+    if (config.vars && typeof config.vars === 'object') {
+        for (const [key, value] of Object.entries(config.vars)) {
+            if (typeof value === 'string' && value.trim() === '') {
+                delete config.vars[key];
+                emptyVars.push(key);
+            }
+        }
+    }
+
     writeFileSync(outPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
 
     console.log(`✅ 已生成 ${outPath}`);
@@ -135,6 +148,20 @@ function main() {
     if (missing.length > 0) {
         console.warn(`⚠️ 以下变量为空，部署后对应功能不可用：${missing.join(', ')}`);
         console.warn('   （可以在仓库 Secrets/Variables 里补，或部署后在 Cloudflare 控制台 Settings → Variables 补）');
+    }
+
+    // 初始化安全提示：三种模式（preset / token / locked）对应完全不同的安全强度
+    // 兼容 CI 里的 *_INPUT 命名（密钥在 CI 中不直接叫 ADMIN_PASS，避免误进配置）
+    const adminMail = String(env.ADMIN_MAIL ?? '').trim();
+    const adminPass = String(env.ADMIN_PASS || env.ADMIN_PASS_INPUT || '').trim();
+    const setupToken = String(env.SETUP_TOKEN || env.SETUP_TOKEN_INPUT || '').trim();
+    if (adminMail && adminPass) {
+        console.log('   初始化安全：preset（已预置管理员，首次请求自动建号，向导不开放）✔ 推荐');
+    } else if (setupToken) {
+        console.log('   初始化安全：token（向导开放，必须携带 SETUP_TOKEN）');
+    } else {
+        console.warn('   ⚠️ 初始化安全：locked —— 未配置 ADMIN_MAIL+ADMIN_PASS 或 SETUP_TOKEN，');
+        console.warn('      站点初始化接口将拒绝服务（这是防止扫站抢注的 fail-closed 默认值）。');
     }
 }
 

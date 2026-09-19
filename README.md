@@ -116,6 +116,7 @@
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
 | **`DCV_TOKEN` 只认 Global API Key** | `src/agent.ts` 固定发 `X-Auth-Email` + `X-Auth-Key`，填 scoped API Token 会报 `6003 Invalid request headers` | 改为按 token 形态自动选择鉴权头，两种凭证都能用（推荐 scoped Token，权限可限定到单个域名） |
 | **关闭注册后可被绕过** | `REGISTER_ALLOW=false` 只在「发验证码」阶段拦截；若库里已有 `flag=0` 的待验证行（管理员在用户点了发码之后才关闭注册），直接调 `/setup/` 仍能完成注册——实测复现 | 写库入口 `userRegs` 对新注册（`flag=0`）二次校验开关；同时补上验证码 5 分钟时效（原来旧验证码可永久复用） |
+| **初始化接口无鉴权，可被抢注管理员**（严重） | `/setup` 原先只检查 `INITIALIZED` 标记，**没有任何鉴权**。站点未初始化时，任何人扫到域名即可 `POST /setup` 把自己写成管理员——实测完整复现：攻击者无凭据拿到 `is_admin=1`、能用自己的密码登录、还能篡改站点标题与域名 | 改为 **fail-closed 三模式**：`preset`（预置 `ADMIN_MAIL`+`ADMIN_PASS`，首次访问自动建号、向导不开放）／`token`（向导开放但需 `SETUP_TOKEN`）／`locked`（未配置则直接拒绝，默认态）。密钥经 `wrangler secret put` 注入，不进配置与日志 |
 
 ### 🤖 v2.3：内置 GitHub Actions 部署（参考 cloud-mail）
 
@@ -296,6 +297,8 @@ npm run deploy-cf:test
 | `CLOUDFLARE_API_TOKEN` | ✅ | Cloudflare API 令牌，模板 `Edit Cloudflare Workers`，另加 `D1:Edit` |
 | `CLOUDFLARE_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（控制台右侧栏可复制） |
 | `MAIL_KEYS` / `MAIL_SEND` | ⭕ | Resend 密钥 / 发件人。**不填也能部署**，但注册/找回密码要邮箱验证码，等于没法注册 |
+| `ADMIN_MAIL` + `ADMIN_PASS` | ⭕ | **强烈推荐**：预置管理员，首次访问自动建号、初始化向导不开放（防扫站抢注） |
+| `SETUP_TOKEN` | ⭕ | 不想预置密码时的替代：向导开放但必须携带此令牌 |
 | `AUTH_KEYS` | ⭕ | 人机验证 Secret（Turnstile）。只有开启验证码时才用，默认关闭 |
 | `DCV_AGENT` / `DCV_EMAIL` / `DCV_TOKEN` / `DCV_ZONES` | ⭕ | DCV 自动验证代理（不填则只能每次手动加 DNS TXT 记录） |
 | `NAME` | ❌ | Worker 名称，默认 `cfworker-acme` |
@@ -355,24 +358,51 @@ Cloudflare API Token 建议勾选（在 [API Tokens](https://dash.cloudflare.com
 > 不设 `CUSTOM_DOMAIN` 也完全可用，只是地址是 `https://cfworker-acme.<你的子域>.workers.dev`。
 > 之后想加域名，补上这个变量再跑一次工作流即可，**不需要重新建库、数据不丢**。
 
-#### 🔐 管理员账号密码：在网站里设，不在 Cloudflare 后台
+#### 🔐 管理员账号：两种方式，**强烈推荐预置**
 
-**Cloudflare 侧只放"部署相关"的东西**（Token、Account ID、D1），
-站点自己的配置在**第一次打开网站时**由初始化向导 `/setup` 完成：
+> ⚠️ **重要背景**：早期版本的 `/setup` 初始化接口**没有任何鉴权**——只要站点还没初始化，
+> 任何人扫到域名都能抢先 POST 一次把自己变成管理员（`is_admin=1`）并标记初始化，
+> 从而完全接管站点。**现已修复为 fail-closed**，并新增「预置管理员」模式。
+> 如果你部署过旧版本且站点仍处于未初始化状态，请尽快升级。
+
+三种模式（按优先级自动判定）：
+
+| 模式 | 触发条件 | 安全性 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **preset** ⭐ | 配了 `ADMIN_MAIL` + `ADMIN_PASS` | **最高** | 首次访问自动创建管理员，**初始化向导完全不开放**，没有任何可被抢注的入口 |
+| token | 只配了 `SETUP_TOKEN` | 中 | 向导仍可用，但提交时必须填对令牌 |
+| locked | 三者都没配 | 安全但不可用 | 初始化接口直接拒绝（默认态），需补配置后重跑 |
+
+**推荐做法**（推荐 preset）：
+
+```yaml
+# 仓库 Settings → Secrets and variables → Actions
+ADMIN_MAIL:  you@example.com     # 管理员登录邮箱
+ADMIN_PASS:  <你的强密码>         # 明文即可，部署时自动转 SHA256；填 64 位 hex 则按已哈希处理
+```
+
+> 🔒 `ADMIN_PASS` 与 `SETUP_TOKEN` 由工作流用 `wrangler secret put` 写入，
+> **不会出现在 wrangler 配置、仓库或部署日志里**；`ADMIN_MAIL` 不敏感，走普通变量。
+> 两个 secret 在**首次部署之后**写入（Worker 还不存在时 `secret put` 会失败），
+> 之后站点会在首次访问时自动建号并标记初始化。
+
+如果你想自己点一遍向导（token 模式）：
 
 | 向导里要填 | 对应变量 | 说明 |
 | :--- | :--- | :--- |
+| 初始化令牌 | `SETUP_TOKEN` | **必填**（token 模式下） |
 | 站点域名 | `SITE_HOST` | 默认自动填当前访问的域名 |
 | 站点标题 | `SITE_TITLE` | 页面标题 |
 | 管理员邮箱 | — | **就是你的登录账号** |
 | 管理员密码 | — | **在这里设置**，前端 SHA256 后入库 |
 | 邮件功能开关 + Resend Key | `MAIL_KEYS` / `MAIL_SEND` | 也可以在向导里填 |
 
-流程：部署完成 → 打开站点 → 自动跳 `/setup` → 填完提交 → 跳登录页 → 用刚设的邮箱密码登录。
+流程（token 模式）：部署完成 → 打开站点 → 自动跳 `/setup` → 填入 `SETUP_TOKEN` 与管理员信息 → 提交 → 用刚设的邮箱密码登录。
 **初始化标记 `INITIALIZED=true` 写入后该页面即失效**，所以密码要自己记牢。
 
 > 想改这些配置不用重新部署：登录后进 **系统管理 → 配置**（`/admin/confs`），
 > 邮件、DCV、注册策略、CA 凭据都能在线改，改完立即生效。
+> 注意 `ADMIN_MAIL` **不在**可在线编辑的白名单里——它属于部署期配置，改了要重新部署。
 
 #### 🚫 关闭注册（防止陌生人白嫖）
 

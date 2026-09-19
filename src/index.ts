@@ -26,6 +26,11 @@ export type Bindings = {
     // 邮件 / 站点 / 鉴权 -------------------------------------------
     MAIL_KEYS: string, MAIL_SEND: string, AUTH_KEYS: string, SITE_KEYS?: string,
     SITE_HOST?: string, SITE_TITLE?: string,
+    // 初始化安全（防止站点被扫到后抢注管理员）----------------------
+    // ADMIN_MAIL + ADMIN_PASS 同时存在时：首次请求自动创建管理员，完全跳过初始化向导
+    // SETUP_TOKEN：未预置管理员时，初始化向导必须携带该令牌
+    // 两者都没有 → 初始化接口直接拒绝（fail-closed），需要先配置后再访问
+    ADMIN_MAIL?: string, ADMIN_PASS?: string, SETUP_TOKEN?: string,
     // DNS 代理 -----------------------------------------------------
     DCV_AGENT: string, DCV_EMAIL: string, DCV_TOKEN: string, DCV_ZONES: string,
     // ACME 账号（各 CA 的 EAB） -----------------------------------
