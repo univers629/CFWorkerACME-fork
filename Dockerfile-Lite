@@ -4,10 +4,14 @@ RUN npm install -g webpack
 COPY .env.example .env
 COPY entrypoint-lite.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
-COPY package*.json ./
+# npm workspaces：根 + frontend 两份清单都要在，npm install 才会同时装前端依赖
+COPY package.json package-lock.json ./
+COPY frontend/package.json ./frontend/package.json
+RUN npm install
+COPY frontend ./frontend
 COPY public ./public
 COPY src ./src
-RUN npm install
+RUN npm run build
 COPY src/http.js ./node_modules/acme-client/src/
 EXPOSE 3000
 ENTRYPOINT ["sh","/app/entrypoint.sh"]

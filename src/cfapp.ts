@@ -1,29 +1,41 @@
-import {serveStatic} from 'hono/cloudflare-workers' // @ts-ignore
-import manifest from '__STATIC_CONTENT_MANIFEST'
+/**
+ * Cloudflare Workers 入口
+ * -------------------------------------------------------------------------
+ * 静态资源（前端 dist）不再由 Worker 自己读取：
+ *   - 旧写法依赖 Workers Sites（wrangler.jsonc 的 site.bucket）+ KV 清单模块
+ *     `__STATIC_CONTENT_MANIFEST`，该方案已废弃，且需要额外创建 KV 命名空间；
+ *   - 现在改用 Workers 静态资源（wrangler.jsonc 的 assets 段）：
+ *     命中同名文件时由边缘直接返回（不计费、不经过 Worker），
+ *     未命中时按 not_found_handling = "single-page-application" 回退 index.html。
+ * 因此本文件只保留：Worker 的 fetch（API 路由）与 scheduled（定时任务）。
+ */
+
 import * as index from './index'
 
-// SPA fallback: 尝试访问请求路径对应的静态文件，失败后回退到 index.html
-index.app.use("*", serveStatic({manifest: manifest, root: "./"}));
-index.app.get("*", serveStatic({
-    manifest: manifest,
-    root: "./",
-    path: "index.html",
-} as any));
-// export default index.app
-index.app.fire()
-
-// 定时任务 ############################################################################################################
 export default {
-    async fetch(request: Request, env: index.Bindings, ctx: ExecutionContext) {
+    async fetch(request: Request, env: index.Bindings, ctx: ExecutionContext): Promise<Response> {
         return index.app.fetch(request, env, ctx);
     },
-    async scheduled(controller: ScheduledController, env: index.Bindings, ctx: ExecutionContext) {
-        console.log('Cron job processed');
-        try {
-            console.log(controller, ctx)
 
+    /**
+     * 定时任务（wrangler.jsonc → triggers.crons）
+     * 调用证书状态机，驱动自动签发 / 自动续期（等价于手动访问 /tasks/）。
+     * 原实现只打印日志，导致 Cloudflare 上的订单永远不会自动推进。
+     */
+    async scheduled(controller: ScheduledController, env: index.Bindings, ctx: ExecutionContext) {
+        const started = Date.now();
+        if (!env.DB_CF) {
+            // 显式检查：certs 模块直接操作 D1，缺绑定时给出一条可读的日志而不是 TypeError。
+            console.error('[cron] 未绑定 D1 数据库（DB_CF），跳过本次任务');
+            return;
+        }
+        try {
+            const certs = await import('./certs');
+            const result = await certs.Processing({...env, DB_CF: env.DB_CF});
+            console.log(`[cron] processed=${result.length} cost=${Date.now() - started}ms at ${controller.scheduledTime}`);
         } catch (error) {
-            console.error('Error processing cron job:', error);
+            // 定时任务里抛错会导致整个 cron 失败，这里兜底记录，保证下个周期继续跑。
+            console.error('[cron] Error processing cron job:', error);
         }
     },
 };

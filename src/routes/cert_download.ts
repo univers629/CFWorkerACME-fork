@@ -11,7 +11,7 @@
  */
 
 import type {Context, Hono} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import * as local from "hono/cookie";
 import {ensureDao} from "../db";
 import {userAuth} from "../users";
@@ -34,7 +34,7 @@ function randomPfxPassword(): string {
  * @returns 通过时返回 ApplyRow，失败时返回 Response。
  */
 async function loadOrderForDownload(
-    c: Context<{ Bindings: Bindings }>,
+    c: Context<AppEnv>,
     uuid: string,
 ): Promise<ApplyRow | Response> {
     if (!await userAuth(c)) {
@@ -100,7 +100,7 @@ function buildReadme(order: ApplyRow): string {
 }
 
 /* ============================= GET /ca_zip/ ============================= */
-export async function handleCaZip(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleCaZip(c: Context<AppEnv>): Promise<Response> {
     const uuid = (c.req.query("uuid") ?? "").trim();
     if (!uuid) return c.json({flags: 4, texts: "缺少 uuid"}, 400);
 
@@ -131,7 +131,7 @@ export async function handleCaZip(c: Context<{ Bindings: Bindings }>): Promise<R
 }
 
 /* ============================= GET /ca_pfx/ ============================= */
-export async function handleCaPfx(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleCaPfx(c: Context<AppEnv>): Promise<Response> {
     const uuid = (c.req.query("uuid") ?? "").trim();
     if (!uuid) return c.json({flags: 4, texts: "缺少 uuid"}, 400);
 
@@ -167,7 +167,7 @@ export async function handleCaPfx(c: Context<{ Bindings: Bindings }>): Promise<R
     });
 }
 
-export function mountCertDownloadRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountCertDownloadRoutes(app: Hono<AppEnv>): void {
     app.get("/ca_zip/", handleCaZip);
     app.get("/ca_pfx/", handleCaPfx);
 }

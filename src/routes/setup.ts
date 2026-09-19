@@ -9,7 +9,7 @@
  */
 
 import type {Context, Hono} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao, normalizeDbSource, rawDao} from "../db";
 import {readBool, readConf, writeConf, invalidateConf} from "../db/conf";
 import CryptoJS from "crypto-js";
@@ -71,7 +71,7 @@ function isValidEmail(email: string): boolean {
  * 前端启动时调用，返回初始化状态 + 数据源探测结果。
  * 本接口**不做鉴权**，任何访客都可读。
  */
-export async function handleBootstrap(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleBootstrap(c: Context<AppEnv>): Promise<Response> {
     const env = c.env as any;
     const srcNorm = normalizeDbSource(env.DB_SOURCE);
     const dbSource = (srcNorm || "unset") as BootstrapResult["db_source"];
@@ -170,7 +170,7 @@ async function safeReadBool(env: any, name: string, fallback: boolean): Promise<
  *
  * 成功后返回 200；若系统已初始化返回 409。
  */
-export async function handleSetup(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleSetup(c: Context<AppEnv>): Promise<Response> {
     const env = c.env as any;
 
     // 1) 先确认数据库可用 ----------------------------------------------------
@@ -325,7 +325,7 @@ function randomToken(lens: number): string {
 }
 
 /** 注册本路由到 Hono 应用 */
-export function mountSetupRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountSetupRoutes(app: Hono<AppEnv>): void {
     app.get("/bootstrap", handleBootstrap);
     app.post("/setup", handleSetup);
 }

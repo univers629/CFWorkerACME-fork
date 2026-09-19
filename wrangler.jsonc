@@ -2,7 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cfworker-acme",
   "main": "src/cfapp.ts",
-  "compatibility_date": "2025-03-10",
+  // 兼容性日期：建议随升级改为「当天日期」；仓库不能写未来日期，否则 wrangler deploy 会报错。
+  "compatibility_date": "2026-09-19",
   "compatibility_flags": [
     "nodejs_compat"
   ],
@@ -29,23 +30,78 @@
     "ZRO_keyID": "",
     "ZRO_KeyTS": ""
   },
-  "site": {
-    "bucket": "./public"
+  // ===== 静态资源（原 Workers Sites / site.bucket 已废弃，改用 Workers 静态资源）=====
+  // directory 指向前端构建产物（frontend/vite.config.ts 的 outDir = ../public）。
+  // 静态文件由 Cloudflare 边缘直接返回，不消耗 Worker 调用次数。
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // 未命中任何静态文件时回退到 /index.html（前端是 HashRouter 单页应用）
+    "not_found_handling": "single-page-application",
+    // 这些前缀始终先进入 Worker 脚本（API 路由）；放在这里可以避免
+    // 「浏览器地址栏直接打开接口地址却拿到 index.html」的问题。
+    // 需要与 src/index.ts、src/routes/* 中注册的路由前缀保持一致。
+    "run_worker_first": [
+      "/bootstrap",
+      "/setup",
+      "/setup/*",
+      "/login",
+      "/login/*",
+      "/nonce",
+      "/nonce/*",
+      "/check",
+      "/check/*",
+      "/exits",
+      "/exits/*",
+      "/apply",
+      "/apply/*",
+      "/order",
+      "/order/*",
+      "/acmes",
+      "/acmes/*",
+      "/token",
+      "/token/*",
+      "/erase",
+      "/erase/*",
+      "/certs",
+      "/certs/*",
+      "/panel",
+      "/panel/*",
+      "/users",
+      "/users/*",
+      "/tests",
+      "/tests/*",
+      "/tasks",
+      "/tasks/*",
+      "/clean",
+      "/clean/*",
+      "/admin/*",
+      "/api/*",
+      "/account/*",
+      "/ca_zip/*",
+      "/ca_pfx/*"
+    ]
   },
+  // ===== 数据库 =====
+  // 这里只声明 binding + database_name、不写 database_id：
+  // wrangler >= 4.45 会自动创建 D1 数据库并回填 ID（自动资源创建，默认开启）。
+  // 已经手动创建过数据库的话，把 database_id 填回来即可（老用户数据不受影响）。
   "d1_databases": [
     {
       "binding": "DB_CF",
-      "database_name": "DB_CF",
-      "database_id": "<database-id>"
+      "database_name": "DB_CF"
     }
   ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
   },
+  "upload_source_maps": true,
   "triggers": {
+    // 定时任务：驱动订单状态机（自动续期 / 自动签发）。
+    // 原先 */1 每分钟一次，改为 5 分钟一次已足够，且能省下 80% 的调用。
     "crons": [
-      "*/1 * * * *"
+      "*/5 * * * *"
     ]
   }
 }

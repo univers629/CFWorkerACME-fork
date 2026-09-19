@@ -4,9 +4,12 @@ import * as saves from './saves'
 import * as index from './index'
 import * as agent from "./agent";
 import * as query from "./query";
-import {Bindings} from './index'
+import {Bindings, D1Bindings} from './index'
 import {hmacSHA2} from "./users";
-import {errors} from "wrangler";
+// 注意：这里曾经有一行 `import {errors} from "wrangler";`（实际从未使用）。
+// 它会让 esbuild 在打包 Worker 时去解析 wrangler 这个 10MB+ 的开发期 CLI 包，
+// 一旦安装时跳过了 devDependencies（npm ci --omit=dev），打包就会直接失败。
+// 已删除，不要加回来。
 import {readConf} from "./db/conf";
 
 
@@ -96,7 +99,7 @@ export function extractAcmeError(e: any): string {
 }
 
 // 整体处理进程 ====================================================================================
-export async function Processing(env: Bindings) {
+export async function Processing(env: D1Bindings) {
     let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
     let result: any[] = []
     for (const id in order_list) { // 获取信息 ==================================================================
@@ -119,7 +122,7 @@ export async function Processing(env: Bindings) {
 // - flag=5  证书签发完成
 // - flag=-1 失败
 // - 或中间某步 flag 未发生变化（避免死循环）
-export async function processOne(env: Bindings, order_uuid: string) {
+export async function processOne(env: D1Bindings, order_uuid: string) {
     let result: any[] = [];
     // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
     {
@@ -181,7 +184,7 @@ export async function processOne(env: Bindings, order_uuid: string) {
 }
 
 // 新增证书订单 =====================================================================================
-export async function newApply(env: Bindings, order_user: any, order_info: any) {
+export async function newApply(env: D1Bindings, order_user: any, order_info: any) {
     // 获取申请域名信息 =============================================================================
     let client_data: any = await getStart(env, order_user, order_info); // 获取域名证书的申请操作接口
     if (client_data == null) return {"texts": "处理失败，详见日志输出"};
@@ -216,7 +219,7 @@ export async function newApply(env: Bindings, order_user: any, order_info: any) 
 }
 
 // 自动验证代理 =====================================================================================
-export async function setApply(env: Bindings, order_user: any, order_info: any) {
+export async function setApply(env: D1Bindings, order_user: any, order_info: any) {
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
@@ -282,7 +285,7 @@ export async function setApply(env: Bindings, order_user: any, order_info: any) 
 }
 
 // 修改验证状态 =====================================================================================
-export async function opDomain(env: Bindings, order_user: any, order_info: any, sets_list: string[]) {
+export async function opDomain(env: D1Bindings, order_user: any, order_info: any, sets_list: string[]) {
     let domain_list: any = order_info['list'];
     // 执行操作部分 =================================================================================
     let domain_save: any[] = []
@@ -313,7 +316,7 @@ export async function opDomain(env: Bindings, order_user: any, order_info: any, 
 }
 
 // 执行域名验证 ====================================================================================
-export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) {
+export async function dnsAuthy(env: D1Bindings, order_user: any, order_info: any) {
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
@@ -378,7 +381,7 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
 }
 
 // 完成证书申请 #######################################################################################################
-export async function getCerts(env: Bindings, order_user: any, order_info: any) {
+export async function getCerts(env: D1Bindings, order_user: any, order_info: any) {
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
     let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
@@ -431,7 +434,7 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any) 
 //  5 cessationOfOperation   停止运营
 export const REVOKE_REASONS = new Set<number>([0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
 
-export async function revokeCert(env: Bindings, order_info: any, reason: number = 0) {
+export async function revokeCert(env: D1Bindings, order_info: any, reason: number = 0) {
     // 基本校验：必须存在证书原文 =====================================================================
     const cert_pem: string = order_info?.cert || "";
     if (!cert_pem || !/BEGIN CERTIFICATE/.test(cert_pem)) {
@@ -499,7 +502,7 @@ async function getNames(order_info: any, full: boolean = false) {
 }
 
 // 获取操作接口 ####################################################################################
-async function getStart(env: Bindings, order_user: any, order_info: any) {
+async function getStart(env: D1Bindings, order_user: any, order_info: any) {
     let acme_url = acme_url_map[order_info['sign']];
     // 从 Confs 优先读取三家 CA 的账户凭据（回退到 env / 默认值）
     const [GTS_KeyTS, GTS_keyID, GTS_keyMC,

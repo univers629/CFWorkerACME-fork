@@ -42,4 +42,7 @@ wrangler.oplists.jsonc
 
 /.idea/*
 .codebuddy
-public
+
+# 前端构建产物：源码在 frontend/，public/ 只是 vite 的 outDir（构建时生成 index.html / assets / favicon.svg）。
+# 注意不要写成裸的 `public`——那会把 frontend/public/（favicon 等源文件）一起忽略掉。
+/public/*

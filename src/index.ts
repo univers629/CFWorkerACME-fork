@@ -1,4 +1,5 @@
 import {Context, Hono} from 'hono'
+import type {UserRow} from './db/dao'
 import {opDomain} from "./certs";
 import {cleanDNS} from "./query";
 import * as users from './users';
@@ -32,7 +33,24 @@ export type Bindings = {
     SSL_keyMC: string, SSL_keyID: string, SSL_KeyTS: string, SSL_useIt: string,
     ZRO_keyMC: string, ZRO_keyID: string, ZRO_KeyTS: string, ZRO_useIt: string
 }
-export const app = new Hono<{ Bindings: Bindings }>()
+
+/**
+ * 需要「直接」操作 D1 的模块（certs.ts 等）使用的绑定类型。
+ * 这些代码绕过 DAO 抽象直接调用 saves.selectDB(env.DB_CF, ...)，
+ * 因此要求 DB_CF 必然存在；缺失时由调用方给出明确报错，而不是中途 TypeError。
+ */
+export type D1Bindings = Bindings & { DB_CF: D1Database };
+
+/** 通过 c.set() 注入到请求上下文里的变量 */
+export type AppVariables = {
+    admin?: UserRow,
+    apiUser?: UserRow,
+};
+
+/** 全项目统一的 Hono 环境类型（app / 各路由模块 / 中间件共用） */
+export type AppEnv = { Bindings: Bindings, Variables: AppVariables };
+
+export const app = new Hono<AppEnv>()
 
 // 初始化向导 #############################################################################
 // GET /bootstrap → 前端启动时调用，返回初始化/数据源状态

@@ -25,17 +25,18 @@
     "forceConsistentCasingInFileNames": true,
 
     /* Paths */
-    "baseUrl": ".",
+    // TypeScript 6 起 baseUrl 已废弃，设置它会直接以 TS5101 报错并中断构建，
+    // 因此这里不设 baseUrl，路径映射统一写成相对 tsconfig 的 "./xxx/*"。
     "paths": {
-      "@/*": ["src/*"],
-      "@api/*": ["src/api/*"],
-      "@components/*": ["src/components/*"],
-      "@hooks/*": ["src/hooks/*"],
-      "@layouts/*": ["src/layouts/*"],
-      "@pages/*": ["src/pages/*"],
-      "@stores/*": ["src/stores/*"],
-      "@theme/*": ["src/theme/*"],
-      "@utils/*": ["src/utils/*"]
+      "@/*": ["./src/*"],
+      "@api/*": ["./src/api/*"],
+      "@components/*": ["./src/components/*"],
+      "@hooks/*": ["./src/hooks/*"],
+      "@layouts/*": ["./src/layouts/*"],
+      "@pages/*": ["./src/pages/*"],
+      "@stores/*": ["./src/stores/*"],
+      "@theme/*": ["./src/theme/*"],
+      "@utils/*": ["./src/utils/*"]
     },
 
     /* Types */

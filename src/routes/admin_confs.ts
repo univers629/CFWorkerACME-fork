@@ -13,7 +13,7 @@
  */
 
 import type {Context, Hono} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao} from "../db";
 import {invalidateConf, readConfMap, writeConf, removeConf} from "../db/conf";
 import {adminMiddleware} from "../middleware/admin";
@@ -71,7 +71,7 @@ const SECRET_KEYS = new Set<string>([
 ]);
 
 /** GET /admin/confs —— 一次性快照 */
-export async function handleListConfs(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleListConfs(c: Context<AppEnv>): Promise<Response> {
     const map = await readConfMap(c.env as any, ALLOWED_KEYS);
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(map)) {
@@ -85,7 +85,7 @@ export async function handleListConfs(c: Context<{ Bindings: Bindings }>): Promi
 }
 
 /** PUT /admin/confs/:name —— 写入 */
-export async function handlePutConf(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handlePutConf(c: Context<AppEnv>): Promise<Response> {
     const name = c.req.param("name") ?? "";
     if (!ALLOWED_KEYS.includes(name)) {
         return c.json({flags: 4, texts: "配置项不受管理"}, 400);
@@ -134,7 +134,7 @@ export async function handlePutConf(c: Context<{ Bindings: Bindings }>): Promise
 }
 
 /** DELETE /admin/confs/:name —— 回退 env/默认值 */
-export async function handleDeleteConf(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleDeleteConf(c: Context<AppEnv>): Promise<Response> {
     const name = c.req.param("name") ?? "";
     if (!ALLOWED_KEYS.includes(name)) {
         return c.json({flags: 4, texts: "配置项不受管理"}, 400);
@@ -144,7 +144,7 @@ export async function handleDeleteConf(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /** POST /admin/confs/mail/test —— Resend 空载发送测试 */
-export async function handleMailTest(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleMailTest(c: Context<AppEnv>): Promise<Response> {
     let body: any;
     try {
         body = await c.req.json();
@@ -179,7 +179,7 @@ export async function handleMailTest(c: Context<{ Bindings: Bindings }>): Promis
 }
 
 /** POST /admin/confs/captcha/test —— 验证码空载校验 */
-export async function handleCaptchaTest(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleCaptchaTest(c: Context<AppEnv>): Promise<Response> {
     let body: any;
     try {
         body = await c.req.json();
@@ -233,7 +233,7 @@ export async function handleCaptchaTest(c: Context<{ Bindings: Bindings }>): Pro
 }
 
 /** 挂载 */
-export function mountAdminConfsRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/confs", adminMiddleware);
     app.use("/admin/confs/*", adminMiddleware);
     app.get("/admin/confs", handleListConfs);

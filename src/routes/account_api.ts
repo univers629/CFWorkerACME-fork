@@ -10,7 +10,7 @@
 
 import type {Context, Hono} from "hono";
 import * as local from "hono/cookie";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao} from "../db";
 import {userAuth, newNonce} from "../users";
 
@@ -23,7 +23,7 @@ async function fingerprint(token: string): Promise<string> {
     return hex;
 }
 
-async function handleGetToken(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleGetToken(c: Context<AppEnv>): Promise<Response> {
     if (!await userAuth(c)) return c.json({flags: 2, texts: "用户尚未登录"}, 401);
     const mail = local.getCookie(c, "mail") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -42,7 +42,7 @@ async function handleGetToken(c: Context<{ Bindings: Bindings }>): Promise<Respo
     return c.json(body);
 }
 
-async function handleRotateToken(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleRotateToken(c: Context<AppEnv>): Promise<Response> {
     if (!await userAuth(c)) return c.json({flags: 2, texts: "用户尚未登录"}, 401);
     const mail = local.getCookie(c, "mail") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -56,7 +56,7 @@ async function handleRotateToken(c: Context<{ Bindings: Bindings }>): Promise<Re
     });
 }
 
-export function mountAccountApiRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountAccountApiRoutes(app: Hono<AppEnv>): void {
     app.get("/account/apitoken", handleGetToken);
     app.post("/account/apitoken/rotate", handleRotateToken);
 }

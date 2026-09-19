@@ -14,7 +14,7 @@
  */
 
 import type {Context, Hono} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao} from "../db";
 import type {QueryFilter, UserRow} from "../db/dao";
 import {adminMiddleware} from "../middleware/admin";
@@ -54,7 +54,7 @@ function monthRangeUtc(now: Date = new Date()): { start: number; end: number } {
 }
 
 /* ============================= GET /admin/users ============================= */
-export async function handleListUsers(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleListUsers(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const q = c.req.query();
     const page = Math.max(1, parseInt(q.page ?? "1", 10) || 1);
@@ -99,7 +99,7 @@ export async function handleListUsers(c: Context<{ Bindings: Bindings }>): Promi
 }
 
 /* ============================= PATCH /admin/users/:mail ============================= */
-export async function handleUpdateUser(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleUpdateUser(c: Context<AppEnv>): Promise<Response> {
     const admin = c.get("admin") as UserRow;
     const target = decodeURIComponent(c.req.param("mail") ?? "").toLowerCase();
     if (!target) return c.json({flags: 4, texts: "目标邮箱无效"}, 400);
@@ -155,7 +155,7 @@ export async function handleUpdateUser(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /* ============================= POST /admin/users/:mail/password ============================= */
-export async function handleResetPassword(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleResetPassword(c: Context<AppEnv>): Promise<Response> {
     const target = decodeURIComponent(c.req.param("mail") ?? "").toLowerCase();
     if (!target) return c.json({flags: 4, texts: "目标邮箱无效"}, 400);
 
@@ -180,7 +180,7 @@ export async function handleResetPassword(c: Context<{ Bindings: Bindings }>): P
 }
 
 /* ============================= DELETE /admin/users/:mail ============================= */
-export async function handleDeleteUser(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleDeleteUser(c: Context<AppEnv>): Promise<Response> {
     const admin = c.get("admin") as UserRow;
     const target = decodeURIComponent(c.req.param("mail") ?? "").toLowerCase();
     if (!target) return c.json({flags: 4, texts: "目标邮箱无效"}, 400);
@@ -219,7 +219,7 @@ export async function handleDeleteUser(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /* ============================= 挂载 ============================= */
-export function mountAdminUsersRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountAdminUsersRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/users", adminMiddleware);
     app.use("/admin/users/*", adminMiddleware);
     app.get("/admin/users", handleListUsers);

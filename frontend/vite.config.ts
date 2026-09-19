@@ -58,7 +58,9 @@ export default defineConfig({
 
   build: {
     outDir: '../public',
-    emptyOutDir: false, // 保留 public/static 等旧资源
+    // public/ 是纯构建产物目录（index.html / assets / favicon.svg），每次构建先清空，
+    // 避免历史版本的带哈希文件名堆在里面被一起上传到 Cloudflare。
+    emptyOutDir: true,
     assetsDir: 'assets',
     cssCodeSplit: true,
     sourcemap: false,

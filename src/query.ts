@@ -1,7 +1,8 @@
 // 域名记录 #######################
 
 import {dnsAll, dnsAPI, uidDel} from "./agent";
-import {a} from "xior/xior-D_RKcIOK";
+// 注意：这里曾经有一行 `import {a} from "xior/xior-D_RKcIOK";`——它指向 xior 包的内部
+// 哈希文件名，既没有任何地方使用，也会随 xior 升级直接失效（TS2307）。已删除。
 
 interface DnsResponse {
     Status: number; // 查询响应状态

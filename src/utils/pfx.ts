@@ -188,8 +188,9 @@ function toPkcs12Asn1FromPkcs8(
     // 直接使用证书 DER 字节串作为 x509Certificate 的 OCTET STRING 内容，
     // 不再让 forge 尝试解析 X.509 结构（它对 ECC 证书会抛 "OID is not RSA"）。
     const certSafeBags = certs.map((certDer, i) => {
-        const certAttrs = (i === 0) ? bagAttrs : undefined;
-        return asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, [
+        // bagAttributes 只挂在第一张（叶子）证书上；其余证书不挂。
+        // 这里用 push 而不是在数组里塞 undefined：ASN.1 子节点必须是真实对象。
+        const children: any[] = [
             asn1.create(asn1.Class.UNIVERSAL, asn1.Type.OID, false,
                 asn1.oidToDer(oids.certBag).getBytes()),
             asn1.create(asn1.Class.CONTEXT_SPECIFIC, 0, true, [
@@ -202,8 +203,9 @@ function toPkcs12Asn1FromPkcs8(
                     ]),
                 ]),
             ]),
-            certAttrs,
-        ]);
+        ];
+        if (i === 0 && bagAttrs) children.push(bagAttrs);
+        return asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, children);
     });
 
     if (certSafeBags.length > 0) {
@@ -224,12 +226,13 @@ function toPkcs12Asn1FromPkcs8(
     let keyBag: any;
     if (password === null || password === undefined) {
         // 未加密
-        keyBag = asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, [
+        const children: any[] = [
             asn1.create(asn1.Class.UNIVERSAL, asn1.Type.OID, false,
                 asn1.oidToDer(oids.keyBag).getBytes()),
             asn1.create(asn1.Class.CONTEXT_SPECIFIC, 0, true, [pkAsn1]),
-            bagAttrs,
-        ]);
+        ];
+        if (bagAttrs) children.push(bagAttrs);
+        keyBag = asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, children);
     } else {
         // PKCS#8 加密（pkcs8ShroudedKeyBag）
         const encPkInfo = pki.encryptPrivateKeyInfo(pkAsn1, password, {
@@ -237,12 +240,13 @@ function toPkcs12Asn1FromPkcs8(
             count: opts.count,
             saltSize: opts.saltSize,
         } as any);
-        keyBag = asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, [
+        const children: any[] = [
             asn1.create(asn1.Class.UNIVERSAL, asn1.Type.OID, false,
                 asn1.oidToDer(oids.pkcs8ShroudedKeyBag).getBytes()),
             asn1.create(asn1.Class.CONTEXT_SPECIFIC, 0, true, [encPkInfo]),
-            bagAttrs,
-        ]);
+        ];
+        if (bagAttrs) children.push(bagAttrs);
+        keyBag = asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, children);
     }
 
     const keySafeContents = asn1.create(
@@ -264,7 +268,8 @@ function toPkcs12Asn1FromPkcs8(
     let macData: any;
     if (opts.useMac) {
         const sha1 = forge.md.sha1.create();
-        const macSalt = new forge.util.ByteBuffer(forge.random.getBytes(opts.saltSize));
+        // node-forge 的类型声明里 util.ByteBuffer 没被导出（运行时存在），这里显式收窄。
+        const macSalt = new (forge.util as any).ByteBuffer(forge.random.getBytes(opts.saltSize));
         const count = opts.count;
         const macKey = (forge.pkcs12 as any).generateKey(password, macSalt, 3, count, 20);
         const mac = forge.hmac.create();

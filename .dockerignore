@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+node_modules
+frontend/node_modules
+dist
+.wrangler
+public/assets
+images
+*.log
+.env
+.env.*
+wrangler.encrypt.jsonc

@@ -9,9 +9,20 @@
       "ESNext"
     ],
     "types": [
-      "@cloudflare/workers-types/2023-07-01"
+      "@cloudflare/workers-types"
     ],
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
   },
+  // 只编译 Worker 侧代码；前端有独立的 frontend/tsconfig.json。
+  // 不写 include 时，根 tsconfig 会把 frontend/src 下的 React 代码一并拉进来，
+  // 用 Workers + hono/jsx 的类型去编译 React，产生大量无意义报错。
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "frontend",
+    "dist"
+  ]
 }

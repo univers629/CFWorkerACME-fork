@@ -20,7 +20,7 @@
  */
 
 import type {Context, Hono, Next} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao} from "../db";
 import {readInt} from "../db/conf";
 import type {ApplyRow, UserRow} from "../db/dao";
@@ -100,7 +100,7 @@ async function ownsApply(dao: any, user: UserRow, uuid: string): Promise<ApplyRo
 }
 
 /* ============================= POST /api/v1/orders ============================= */
-async function handleCreateOrder(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleCreateOrder(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
 
     // 开放 API 的提交类不走 captcha；统一由 applyGuard 拦截
@@ -155,7 +155,7 @@ function randomUuid(lens: number): string {
 }
 
 /* ============================= GET /api/v1/orders ============================= */
-async function handleListOrders(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleListOrders(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const q = c.req.query();
     const page = Math.max(1, parseInt(q.page ?? "1", 10) || 1);
@@ -181,7 +181,7 @@ async function handleListOrders(c: Context<{ Bindings: Bindings }>): Promise<Res
 }
 
 /* ============================= GET /api/v1/orders/:uuid ============================= */
-async function handleGetOrder(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleGetOrder(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -198,7 +198,7 @@ async function handleGetOrder(c: Context<{ Bindings: Bindings }>): Promise<Respo
 }
 
 /* ============================= 下载类：pem / zip / pfx ============================= */
-async function handleDownloadPem(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleDownloadPem(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -214,7 +214,7 @@ async function handleDownloadPem(c: Context<{ Bindings: Bindings }>): Promise<Re
     });
 }
 
-async function handleDownloadZip(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleDownloadZip(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -241,7 +241,7 @@ async function handleDownloadZip(c: Context<{ Bindings: Bindings }>): Promise<Re
     });
 }
 
-async function handleDownloadPfx(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleDownloadPfx(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     const dao = await ensureDao(c.env as any);
@@ -286,7 +286,7 @@ function primaryDomain(r: ApplyRow): string {
 }
 
 /* ============================= POST /api/v1/orders/:uuid/revoke ============================= */
-async function handleRevokeOrder(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+async function handleRevokeOrder(c: Context<AppEnv>): Promise<Response> {
     const user = c.get("apiUser") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
 
@@ -317,7 +317,7 @@ async function handleRevokeOrder(c: Context<{ Bindings: Bindings }>): Promise<Re
 
 /* ============================= 指纹 / 指示器 ============================= */
 export async function handleApiFingerprint(
-    c: Context<{ Bindings: Bindings }>,
+    c: Context<AppEnv>,
     userMail: string,
 ): Promise<{ configured: boolean; fingerprint: string }> {
     const dao = await ensureDao(c.env as any);
@@ -335,7 +335,7 @@ export async function handleApiFingerprint(
 }
 
 /* ============================= 挂载 ============================= */
-export function mountOpenApiRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountOpenApiRoutes(app: Hono<AppEnv>): void {
     app.use("/api/v1/*", apiAuthMiddleware);
     app.post("/api/v1/orders", handleCreateOrder);
     app.get("/api/v1/orders", handleListOrders);

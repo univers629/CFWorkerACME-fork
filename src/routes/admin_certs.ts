@@ -10,7 +10,7 @@
  */
 
 import type {Context, Hono} from "hono";
-import type {Bindings} from "../index";
+import type {AppEnv, Bindings} from "../index";
 import {ensureDao} from "../db";
 import type {ApplyRow, QueryFilter, UserRow} from "../db/dao";
 import {adminMiddleware} from "../middleware/admin";
@@ -41,7 +41,7 @@ function briefApply(r: ApplyRow): any {
 }
 
 /* ============================= GET /admin/certs ============================= */
-export async function handleListCerts(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleListCerts(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const q = c.req.query();
     const page = Math.max(1, parseInt(q.page ?? "1", 10) || 1);
@@ -71,7 +71,7 @@ export async function handleListCerts(c: Context<{ Bindings: Bindings }>): Promi
 }
 
 /* ============================= PATCH /admin/certs/:uuid ============================= */
-export async function handleUpdateCert(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleUpdateCert(c: Context<AppEnv>): Promise<Response> {
     const admin = c.get("admin") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     if (!uuid) return c.json({flags: 4, texts: "订单 UUID 无效"}, 400);
@@ -106,7 +106,7 @@ export async function handleUpdateCert(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /* ============================= POST /admin/certs/:uuid/revoke ============================= */
-export async function handleRevokeCert(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleRevokeCert(c: Context<AppEnv>): Promise<Response> {
     const admin = c.get("admin") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     if (!uuid) return c.json({flags: 4, texts: "订单 UUID 无效"}, 400);
@@ -149,7 +149,7 @@ export async function handleRevokeCert(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /* ============================= POST /admin/certs/:uuid/purge ============================= */
-export async function handlePurgeCert(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handlePurgeCert(c: Context<AppEnv>): Promise<Response> {
     const admin = c.get("admin") as UserRow;
     const uuid = c.req.param("uuid") ?? "";
     if (!uuid) return c.json({flags: 4, texts: "订单 UUID 无效"}, 400);
@@ -167,7 +167,7 @@ export async function handlePurgeCert(c: Context<{ Bindings: Bindings }>): Promi
 }
 
 /* ============================= DELETE /admin/certs/:uuid ============================= */
-export async function handleDeleteCert(c: Context<{ Bindings: Bindings }>): Promise<Response> {
+export async function handleDeleteCert(c: Context<AppEnv>): Promise<Response> {
     const uuid = c.req.param("uuid") ?? "";
     if (!uuid) return c.json({flags: 4, texts: "订单 UUID 无效"}, 400);
 
@@ -190,7 +190,7 @@ export async function handleDeleteCert(c: Context<{ Bindings: Bindings }>): Prom
 }
 
 /* ============================= 挂载 ============================= */
-export function mountAdminCertsRoutes(app: Hono<{ Bindings: Bindings }>): void {
+export function mountAdminCertsRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/certs", adminMiddleware);
     app.use("/admin/certs/*", adminMiddleware);
     app.get("/admin/certs", handleListCerts);
