@@ -52,3 +52,6 @@ wrangler.action.local.jsonc
 wrangler.action.ci.jsonc
 dist-dry-run/
 wrangler.action.ci2.jsonc
+
+# CI 生成的密钥文件（由 scripts/gen-wrangler-config.mjs 产出，含明文密钥）
+.deploy-secrets.json

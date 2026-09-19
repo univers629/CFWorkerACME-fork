@@ -66,6 +66,63 @@ jobs:
             console.log('库名覆盖校验通过 ✔');
           "
 
+      # 隐私回归测试：确保敏感值永远不写进 wrangler 配置。
+      # 背景：`wrangler deploy` 会把 vars 的明文值打印到日志，而公开仓库的
+      # Actions 日志人人可见（GitHub 只自动脱敏 secrets.* 来源的值）。
+      - name: Check no sensitive values leak into wrangler config
+        env:
+          NAME: ci-leak-check
+          MAIL_KEYS: 'sk_live_LEAKCANARY_KEY'
+          MAIL_SEND: 'canary@leak.example.com'
+          AUTH_KEYS: 'turnstile_LEAKCANARY'
+          SITE_HOST: 'leak-canary.example.com'
+          CUSTOM_DOMAIN: 'leak-canary.example.com'
+          DCV_AGENT: 'dcv.leak-canary.example.com'
+          DCV_EMAIL: 'canary@leak.example.com'
+          DCV_TOKEN: 'cf_LEAKCANARY_TOKEN'
+          ADMIN_MAIL: 'canary@leak.example.com'
+          ADMIN_PASS_INPUT: 'LEAKCANARY_PASSWORD'
+          SETUP_TOKEN_INPUT: 'LEAKCANARY_SETUP_TOKEN'
+          DB_SOURCE: d1
+        run: |
+          set -uo pipefail
+          node scripts/gen-wrangler-config.mjs wrangler.action.leak.jsonc .deploy-secrets.leak.json > gen.log 2>&1
+          cat gen.log
+
+          # 所有敏感值都不允许出现在生成日志里
+          for v in 'sk_live_LEAKCANARY_KEY' 'canary@leak.example.com' 'turnstile_LEAKCANARY' \
+                   'leak-canary.example.com' 'cf_LEAKCANARY_TOKEN' 'LEAKCANARY_PASSWORD' \
+                   'LEAKCANARY_SETUP_TOKEN' 'dcv.leak-canary.example.com'; do
+            if grep -qF "$v" gen.log; then echo "::error::生成日志泄漏了敏感值：$v"; exit 1; fi
+          done
+
+          # 敏感值不允许出现在 wrangler 配置里（routes 里的域名是唯一例外：
+          # 建自定义域名路由必须写入配置，靠 CI 的 ::add-mask:: 脱敏）
+          for v in 'sk_live_LEAKCANARY_KEY' 'canary@leak.example.com' 'turnstile_LEAKCANARY' \
+                   'cf_LEAKCANARY_TOKEN' 'LEAKCANARY_PASSWORD' 'LEAKCANARY_SETUP_TOKEN'; do
+            if grep -qF "$v" wrangler.action.leak.jsonc; then echo "::error::wrangler 配置泄漏了敏感值：$v"; exit 1; fi
+          done
+
+          # 敏感值必须全部出现在密钥文件里，否则部署后功能会缺失
+          node -e "
+            const s = JSON.parse(require('fs').readFileSync('.deploy-secrets.leak.json', 'utf-8'));
+            const want = ['MAIL_KEYS','MAIL_SEND','AUTH_KEYS','SITE_HOST','DCV_AGENT','DCV_EMAIL',
+                          'DCV_TOKEN','ADMIN_MAIL','ADMIN_PASS','SETUP_TOKEN'];
+            const missing = want.filter((k) => !(k in s));
+            if (missing.length) throw new Error('密钥文件缺少：' + missing.join(', '));
+            if (s.ADMIN_PASS !== 'LEAKCANARY_PASSWORD') throw new Error('ADMIN_PASS 未正确收集');
+            console.log('密钥文件校验通过 ✔ 共 ' + Object.keys(s).length + ' 项');
+          "
+
+          # 配置里不应再残留任何敏感 vars
+          node -e "
+            const c = JSON.parse(require('fs').readFileSync('wrangler.action.leak.jsonc', 'utf-8'));
+            const bad = ['MAIL_KEYS','MAIL_SEND','AUTH_KEYS','DCV_TOKEN','ADMIN_MAIL','SITE_HOST']
+              .filter((k) => c.vars && k in c.vars);
+            if (bad.length) throw new Error('敏感项仍残留在 vars：' + bad.join(', '));
+            console.log('配置中敏感 vars 已清空 ✔');
+          "
+
       - name: Assert build output
         run: |
           test -f public/index.html || { echo "public/index.html 缺失"; exit 1; }

@@ -12,6 +12,15 @@ name: 🚀 Deploy to Cloudflare Workers
 #         D1_DATABASE_ID（不填则自动查/建）、CUSTOM_DOMAIN（绑定自定义域名）、
 #         SITE_HOST/SITE_TITLE、GTS_* / SSL_* / ZRO_* 各 CA 的 EAB 参数
 #   没配 CLOUDFLARE_API_TOKEN 时本工作流会自动跳过（不会给推送挂上红叉）。
+#
+# ⚠️ 隐私说明（本仓库是公开的，Actions 日志任何人可见）：
+#   `wrangler deploy` 会明文打印配置里所有 vars 的值，而 GitHub 只自动脱敏
+#   来自 secrets.* 的值。因此本工作流：
+#     1) 把邮箱/域名/各类密钥（20+ 项）从 wrangler 配置里剔除，改用
+#        `wrangler secret bulk` 下发（见 scripts/gen-wrangler-config.mjs）；
+#     2) 对配置里仍存在的值（如 routes 的自定义域名）显式 ::add-mask::；
+#     3) 预检/摘要只报告「是否已配置」，不回显具体值。
+#   另外建议：密钥填在 Secrets 而非 Variables（Variables 对协作者可见）。
 # =============================================================================================
 
 on:
@@ -96,11 +105,39 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
+          # ---------------------------------------------------------------------------
+          # 隐私保护（重要）：本仓库是公开的，Actions 日志任何人可见。
+          # GitHub 只自动脱敏 secrets.* 来源的值；来自 vars.* 的**不会**被脱敏。
+          # 因此这里对所有与部署者身份相关的值显式 add-mask，
+          # 后续任何步骤（包括 wrangler 自己打印的 triggers / 绑定表）输出这些值时
+          # 都会被 GitHub 替换成 ***。
+          # ---------------------------------------------------------------------------
+          # 覆盖全部敏感项（域名、邮箱、各类密钥）。来自 secrets.* 的 GitHub 会自动脱敏，
+          # 但来自 vars.* 的不会——所以这里一律显式 mask，不依赖来源。
+          # 长度 <4 的值不 mask，避免把 "d1" 这类短值打得到处都是 *** 反而看不清日志。
+          for mask_key in \
+            CUSTOM_DOMAIN SITE_HOST MAIL_SEND DCV_AGENT DCV_EMAIL ADMIN_MAIL \
+            MAIL_KEYS AUTH_KEYS SITE_KEYS DCV_TOKEN DCV_ZONES \
+            ADMIN_PASS_INPUT SETUP_TOKEN_INPUT TG_BOT_TOKEN TG_CHAT_ID \
+            GTS_keyMC GTS_keyID GTS_KeyTS \
+            SSL_keyMC SSL_keyID SSL_KeyTS \
+            ZRO_keyMC ZRO_keyID ZRO_KeyTS; do
+            mask_value="${!mask_key:-}"
+            if [ "${#mask_value}" -ge 4 ]; then
+              echo "::add-mask::$mask_value"
+            fi
+          done
+
           # 库名默认与 Worker 同名：面板里 Worker 和 D1 一眼对得上号
           echo "D1_DATABASE_NAME=${D1_DATABASE_NAME_INPUT:-$NAME}" >> "$GITHUB_ENV"
           echo "Worker 名称：$NAME"
           echo "D1 数据库名：${D1_DATABASE_NAME_INPUT:-$NAME}"
-          [ -n "${CUSTOM_DOMAIN:-}" ] && echo "自定义域名：$CUSTOM_DOMAIN" || echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
+          # 不回显域名的具体值（已 add-mask，但仍不主动打印）
+          if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+            echo "自定义域名：已配置（内容已脱敏）"
+          else
+            echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
+          fi
 
           # 这些不是「必需」，缺失只是功能不完整，所以只提示不阻断
           if [ -z "${ADMIN_MAIL:-}" ] && [ -z "${ADMIN_PASS_INPUT:-}" ] && [ -z "${SETUP_TOKEN_INPUT:-}" ]; then
@@ -175,9 +212,13 @@ jobs:
             echo "::warning::未能获取 D1 ID，交给 wrangler 自动创建（需要令牌有 D1 资源创建权限）"
           fi
 
-      - name: 🧩 生成 wrangler 配置（注入 Secrets/Variables）
+      - name: 🧩 生成 wrangler 配置 + 密钥文件
         if: steps.preflight.outputs.skip != 'true'
-        run: node scripts/gen-wrangler-config.mjs wrangler.action.local.jsonc
+        run: |
+          # 敏感项（邮箱/域名/各类密钥）不会写进 wrangler 配置，
+          # 而是单独落到 .deploy-secrets.json，稍后用 `wrangler secret bulk` 下发。
+          # 这样 wrangler 打印绑定表时就不会泄露它们。
+          node scripts/gen-wrangler-config.mjs wrangler.action.local.jsonc .deploy-secrets.json
 
       - name: 🔎 部署前预检（wrangler deploy --dry-run）
         if: steps.preflight.outputs.skip != 'true'
@@ -194,28 +235,34 @@ jobs:
           echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
           echo "✅ 部署完成：${WORKER_URL:-（日志里未解析到 workers.dev 地址，请用 CUSTOM_DOMAIN 访问）}"
 
-      - name: 🔐 写入密钥（必须在首次部署之后：Worker 不存在时 secret put 会失败）
+      - name: 🔐 下发密钥（必须在首次部署之后：Worker 不存在时 secret 会失败）
         if: steps.preflight.outputs.skip != 'true'
         run: |
           set -uo pipefail
 
-          # 用 secret put 而不是 vars：这些值不该出现在 wrangler 配置、仓库和部署日志里。
-          # --config 必须与部署用的一致，否则会写到别的 Worker 上。
-          put_secret() {
-            local key="$1" value="$2"
-            [ -z "$value" ] && return 0
-            if printf '%s' "$value" | npx wrangler secret put "$key" -c wrangler.action.local.jsonc > /tmp/secret.log 2>&1; then
-              echo "✅ 已写入密钥 $key"
-            else
-              echo "::error::写入密钥 $key 失败"; tail -n 5 /tmp/secret.log; exit 1
-            fi
-          }
+          # 用 secret 而不是 vars：这些值既不该出现在 wrangler 配置里
+          # （deploy 会明文打印 vars），也不该出现在公开仓库的日志里。
+          # 密钥文件由上一步生成，权限 0600，且已在 .gitignore 中忽略。
+          if [ ! -s .deploy-secrets.json ]; then
+            echo "ℹ️ 没有需要下发的敏感项（未配置任何邮箱/域名/密钥）"
+            exit 0
+          fi
 
-          put_secret ADMIN_PASS "$ADMIN_PASS_INPUT"
-          put_secret SETUP_TOKEN "$SETUP_TOKEN_INPUT"
+          COUNT="$(jq 'length' .deploy-secrets.json)"
+          KEYS="$(jq -r 'keys | join(", ")' .deploy-secrets.json)"
+          echo "🔐 待下发 $COUNT 项：$KEYS"
 
-          # 两者都配时 preset 优先（预置管理员），SETUP_TOKEN 不生效
-          if [ -n "$ADMIN_PASS_INPUT" ] && [ -n "$SETUP_TOKEN_INPUT" ]; then
+          # 输出重定向到文件，避免 wrangler 的任何回显进入日志
+          if npx wrangler secret bulk .deploy-secrets.json -c wrangler.action.local.jsonc > /tmp/secret.log 2>&1; then
+            echo "✅ 已下发 $COUNT 项密钥"
+          else
+            echo "::error::密钥下发失败"; tail -n 10 /tmp/secret.log; exit 1
+          fi
+
+          # 立即删除，避免残留到后续步骤或 artifact
+          rm -f .deploy-secrets.json
+
+          if [ -n "${ADMIN_PASS_INPUT:-}" ] && [ -n "${SETUP_TOKEN_INPUT:-}" ]; then
             echo "::notice::同时配置了 ADMIN_PASS 与 SETUP_TOKEN，将以 preset（预置管理员）模式运行，向导不开放"
           fi
 
@@ -288,7 +335,7 @@ jobs:
             echo "| :--- | :--- |"
             echo "| Worker 名称 | \`$NAME\` |"
             echo "| workers.dev | ${{ steps.deploy.outputs.worker_url || '（未解析到）' }} |"
-            echo "| 自定义域名 | ${CUSTOM_DOMAIN:-未设置} |"
+            echo "| 自定义域名 | $( [ -n "${CUSTOM_DOMAIN:-}" ] && echo '已配置（已脱敏）' || echo '未设置' ) |"
             echo "| D1 数据库 | \`$D1_DATABASE_NAME\` |"
             echo "| 表结构 | 首次请求自动执行幂等迁移 |"
             echo ""

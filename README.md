@@ -116,6 +116,7 @@
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
 | **`DCV_TOKEN` 只认 Global API Key** | `src/agent.ts` 固定发 `X-Auth-Email` + `X-Auth-Key`，填 scoped API Token 会报 `6003 Invalid request headers` | 改为按 token 形态自动选择鉴权头，两种凭证都能用（推荐 scoped Token，权限可限定到单个域名） |
 | **关闭注册后可被绕过** | `REGISTER_ALLOW=false` 只在「发验证码」阶段拦截；若库里已有 `flag=0` 的待验证行（管理员在用户点了发码之后才关闭注册），直接调 `/setup/` 仍能完成注册——实测复现 | 写库入口 `userRegs` 对新注册（`flag=0`）二次校验开关；同时补上验证码 5 分钟时效（原来旧验证码可永久复用） |
+| **Actions 日志泄漏隐私**（公开仓库） | `wrangler deploy` 会把 `vars` 的明文值（发件邮箱、站点域名、DCV 域名、各类密钥）打印到日志；公开仓库的 Actions 日志任何人可见，而 GitHub 只自动脱敏 `secrets.*` 来源的值 | 敏感项（20+ 项）不再写入 wrangler 配置，改由 `wrangler secret bulk` 下发；其余值显式 `::add-mask::`；生成脚本与摘要不再回显具体值；CI 增加隐私回归测试（LEAKCANARY 哨兵值） |
 | **`NOTIFY_*` 是死开关** | 系统管理页能点，但后端没有任何代码消费——点了完全没反应 | 新增 `src/notify.ts` + `src/expiry.ts` 真正接上：签发成功/失败在状态机里触发，到期提醒由 cron 扫描（含 `Apply.notified` 去重） |
 | **新增 Telegram 推送** | — | 参考 cloud-mail：Bot Token + 多 Chat ID + 开关 + 测试按钮，配置在系统管理页；消息只发给指定会话，不接收任何入站消息 |
 | **初始化接口无鉴权，可被抢注管理员**（严重） | `/setup` 原先只检查 `INITIALIZED` 标记，**没有任何鉴权**。站点未初始化时，任何人扫到域名即可 `POST /setup` 把自己写成管理员——实测完整复现：攻击者无凭据拿到 `is_admin=1`、能用自己的密码登录、还能篡改站点标题与域名 | 改为 **fail-closed 三模式**：`preset`（预置 `ADMIN_MAIL`+`ADMIN_PASS`，首次访问自动建号、向导不开放）／`token`（向导开放但需 `SETUP_TOKEN`）／`locked`（未配置则直接拒绝，默认态）。密钥经 `wrangler secret put` 注入，不进配置与日志 |
@@ -312,6 +313,33 @@ npm run deploy-cf:test
 
 > 条目可以放在 **Secrets** 或 **Variables** 里，两种都识别（敏感值建议用 Secrets）。
 > 没配 `CLOUDFLARE_API_TOKEN` 时工作流会**自动跳过**，不会给每次 push 挂红叉。
+
+#### 🔒 公开仓库的日志隐私（重要）
+
+**Actions 日志对任何人可见**（公开仓库无需登录即可查看），而 `wrangler deploy`
+会把配置里 **所有 `vars` 的明文值**打印出来：
+
+```
+Your Worker has access to the following bindings:
+env.MAIL_SEND ("me@yourdomain.com")        Environment Variable
+env.SITE_HOST ("acme.yourdomain.com")      Environment Variable
+```
+
+GitHub 只会自动脱敏来自 `secrets.*` 的值，**不会**脱敏 `vars.*`。
+所以本项目做了三层防护：
+
+| 措施 | 说明 |
+| :--- | :--- |
+| **敏感项不进配置** | 邮箱、域名、各类密钥共 20+ 项由生成脚本识别后**完全不写入 wrangler 配置**，改由 `wrangler secret bulk` 下发。这样绑定表里根本不会出现它们 |
+| **显式 `::add-mask::`** | 对配置里仍存在的值（如 `routes` 里的自定义域名——建路由必须写进配置）显式脱敏，输出时替换为 `***` |
+| **不回显** | 预检、摘要、生成脚本一律只报告"是否已配置"，不打印具体值 |
+
+> ✅ 这些不是空话：CI 里有一条**隐私回归测试**（`Build Check` 工作流），
+> 用带 `LEAKCANARY` 标记的假值跑一遍生成流程，只要敏感值出现在日志或配置里就直接失败。
+>
+> ⚠️ **仍然要避免的做法**：不要把密钥填进仓库的 **Variables**（用 Secrets）；
+> 因为 Variables 的值本身在仓库设置页里对协作者可见。本项目做了脱敏，
+> 但 Secrets 是更稳妥的选择。
 
 #### 🔑 到底要准备几个令牌？
 
