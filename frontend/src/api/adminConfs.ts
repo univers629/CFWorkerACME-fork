@@ -38,3 +38,8 @@ export async function testMail(to: string) {
 export async function testCaptcha(token: string) {
   return await apiPost('/admin/confs/captcha/test', { token });
 }
+
+/** 发送一条 Telegram 测试消息（验证 Bot Token 与 Chat ID） */
+export async function testTelegram() {
+  return await apiPost('/admin/confs/telegram/test', {});
+}

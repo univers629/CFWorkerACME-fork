@@ -33,6 +33,13 @@ export default {
             const certs = await import('./certs');
             const result = await certs.Processing({...env, DB_CF: env.DB_CF});
             console.log(`[cron] processed=${result.length} cost=${Date.now() - started}ms at ${controller.scheduledTime}`);
+
+            // 到期提醒扫描（NOTIFY_ON_EXPIRE7 / NOTIFY_ON_EXPIRED 的实际消费点）
+            const {scanExpiry} = await import('./expiry');
+            const scanned = await scanExpiry({...env, DB_CF: env.DB_CF});
+            if (scanned.expire7 || scanned.expired) {
+                console.log(`[cron] 到期提醒 expire7=${scanned.expire7} expired=${scanned.expired}`);
+            }
         } catch (error) {
             // 定时任务里抛错会导致整个 cron 失败，这里兜底记录，保证下个周期继续跑。
             console.error('[cron] Error processing cron job:', error);

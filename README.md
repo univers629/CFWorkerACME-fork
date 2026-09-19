@@ -116,6 +116,8 @@
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
 | **`DCV_TOKEN` 只认 Global API Key** | `src/agent.ts` 固定发 `X-Auth-Email` + `X-Auth-Key`，填 scoped API Token 会报 `6003 Invalid request headers` | 改为按 token 形态自动选择鉴权头，两种凭证都能用（推荐 scoped Token，权限可限定到单个域名） |
 | **关闭注册后可被绕过** | `REGISTER_ALLOW=false` 只在「发验证码」阶段拦截；若库里已有 `flag=0` 的待验证行（管理员在用户点了发码之后才关闭注册），直接调 `/setup/` 仍能完成注册——实测复现 | 写库入口 `userRegs` 对新注册（`flag=0`）二次校验开关；同时补上验证码 5 分钟时效（原来旧验证码可永久复用） |
+| **`NOTIFY_*` 是死开关** | 系统管理页能点，但后端没有任何代码消费——点了完全没反应 | 新增 `src/notify.ts` + `src/expiry.ts` 真正接上：签发成功/失败在状态机里触发，到期提醒由 cron 扫描（含 `Apply.notified` 去重） |
+| **新增 Telegram 推送** | — | 参考 cloud-mail：Bot Token + 多 Chat ID + 开关 + 测试按钮，配置在系统管理页；消息只发给指定会话，不接收任何入站消息 |
 | **初始化接口无鉴权，可被抢注管理员**（严重） | `/setup` 原先只检查 `INITIALIZED` 标记，**没有任何鉴权**。站点未初始化时，任何人扫到域名即可 `POST /setup` 把自己写成管理员——实测完整复现：攻击者无凭据拿到 `is_admin=1`、能用自己的密码登录、还能篡改站点标题与域名 | 改为 **fail-closed 三模式**：`preset`（预置 `ADMIN_MAIL`+`ADMIN_PASS`，首次访问自动建号、向导不开放）／`token`（向导开放但需 `SETUP_TOKEN`）／`locked`（未配置则直接拒绝，默认态）。密钥经 `wrangler secret put` 注入，不进配置与日志 |
 
 ### 🤖 v2.3：内置 GitHub Actions 部署（参考 cloud-mail）
@@ -403,6 +405,34 @@ ADMIN_PASS:  <你的强密码>         # 明文即可，部署时自动转 SHA25
 > 想改这些配置不用重新部署：登录后进 **系统管理 → 配置**（`/admin/confs`），
 > 邮件、DCV、注册策略、CA 凭据都能在线改，改完立即生效。
 > 注意 `ADMIN_MAIL` **不在**可在线编辑的白名单里——它属于部署期配置，改了要重新部署。
+
+#### 📢 Telegram 推送（参考 cloud-mail）
+
+证书签发成功 / 失败 / 即将到期 / 已过期，都能推到 Telegram。配置在
+**系统管理 → 配置 → Telegram 推送**：
+
+| 配置项 | 说明 |
+| :--- | :--- |
+| `TG_BOT_ENABLED` | 总开关，默认关闭 |
+| `TG_BOT_TOKEN` | 在 [@BotFather](https://t.me/BotFather) 创建机器人后获得，形如 `123456:ABC-DEF...`（**密钥，只回显是否已配置**） |
+| `TG_CHAT_ID` | 接收会话 ID，**支持多个**（逗号 / 分号 / 空格分隔）。私聊为正数，群组为负数（`-100…`） |
+
+配置完点「发送测试消息」即可验证，无需等到真的签发证书。
+
+> 🔒 **安全性**：消息只会发给你填写的 Chat ID。
+> 本系统**不接收**任何 Telegram 消息——没有 webhook，也不轮询 `getUpdates`，
+> 代码里唯一的出站调用就是 `sendMessage`。所以别人即使搜到你的 Bot 用户名并点了
+> `/start`，也**收不到**任何推送（我们根本不知道他的 Chat ID）。这与 cloud-mail 的行为一致。
+>
+> ⚠️ **唯一要注意**：推送到**群组**时，群里所有成员都能看到消息内容（含域名、用户邮箱、订单号）。
+> 请只用私聊或只有你自己的私有群；建议在 @BotFather 用 `/setjoingroups` 禁止他人把机器人拉进群。
+>
+> ℹ️ 若用私聊，需要**你先给机器人发一句话**（点 Start），否则 Telegram 会拒绝机器人主动发起会话——
+> 这是 Telegram 的平台规则，不是本项目限制。
+
+**四个通知开关**（`NOTIFY_ON_SUCCESS` / `NOTIFY_ON_FAIL` / `NOTIFY_ON_EXPIRE7` / `NOTIFY_ON_EXPIRED`）
+现在真正生效了：前两个在证书状态机里触发，后两个由 cron 定期扫描（`src/expiry.ts`）。
+到期提醒会写入 `Apply.notified` 去重，**同一张证书的同一类提醒只推一次**；续期成功后自动清空，下个周期可重新提醒。
 
 #### 🚫 关闭注册（防止陌生人白嫖）
 

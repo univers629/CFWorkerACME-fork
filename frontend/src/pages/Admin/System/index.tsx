@@ -11,6 +11,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -40,6 +41,7 @@ import {
   deleteAdminConf,
   testMail,
   testCaptcha,
+  testTelegram,
 } from '@api/adminConfs';
 import { useBootstrapStore } from '@stores/useBootstrapStore';
 
@@ -112,6 +114,9 @@ export default function AdminSystemPage() {
   const [captchaTestOpen, setCaptchaTestOpen] = useState(false);
   const [captchaToken, setCaptchaToken] = useState('');
   const [captchaTesting, setCaptchaTesting] = useState(false);
+
+  // Telegram 测试
+  const [tgTesting, setTgTesting] = useState(false);
 
   const fetchAll = async () => {
     setLoading(true);
@@ -388,6 +393,19 @@ export default function AdminSystemPage() {
     }
   };
 
+  const doTelegramTest = async () => {
+    setTgTesting(true);
+    try {
+      const res: any = await testTelegram();
+      if (res?.flags === 0) message.success(res?.texts || '测试消息已发送');
+      else message.error(res?.texts || '发送失败');
+    } catch (e: any) {
+      message.error(e?.texts || e?.message || '发送失败');
+    } finally {
+      setTgTesting(false);
+    }
+  };
+
   const doCaptchaTest = async () => {
     if (!captchaToken.trim()) {
       message.error('请先在其它标签页获取一次验证码 token 并粘贴到此处');
@@ -502,6 +520,74 @@ export default function AdminSystemPage() {
         >
           发送测试邮件
         </Button>
+      </Card>
+
+      {/* Telegram 推送 ============================================== */}
+      <Card title="Telegram 推送" style={{ marginBottom: 16 }}>
+        {renderBool(
+          'TG_BOT_ENABLED',
+          '启用 Telegram 推送',
+          '关闭后下列事件不再推送到 Telegram（邮件通知不受影响）',
+        )}
+        {renderText('TG_BOT_TOKEN', 'Bot Token', {
+          help: '在 Telegram 里找 @BotFather 创建机器人后获得，形如 123456:ABC-DEF...',
+          placeholder: '123456789:AA...',
+        })}
+        {renderText('TG_CHAT_ID', 'Chat ID', {
+          help: '接收消息的会话 ID，支持多个（用逗号分隔）；群组 ID 为负数，形如 -1001234567890',
+          placeholder: '-1001234567890',
+        })}
+        <Alert
+          type="success"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="消息只会发给下面配置的 Chat ID"
+          description={
+            <>
+              本系统<strong>不接收</strong>任何 Telegram 消息（没有 webhook，也不轮询
+              getUpdates），发送目标只有你在此处填写的 Chat ID。
+              因此即使别人搜到你的 Bot 用户名并点了 /start，他也<strong>收不到</strong>
+              任何推送——我们根本不知道他的 Chat ID。
+            </>
+          }
+        />
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="唯一要注意的：别把机器人拉进有外人的群"
+          description={
+            <>
+              推送到<strong>群组</strong>时，该群所有成员都能看到消息内容（含域名、
+              用户邮箱、订单号）。请只用<strong>自己的私聊</strong>或<strong>只有你自己的私有群</strong>。
+              建议在 @BotFather 里用 <code>/setjoingroups</code> 禁止他人把机器人拉进群。
+            </>
+          }
+        />
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="怎么拿到 Chat ID？"
+          description={
+            <>
+              先私聊机器人发一句话（或把它拉进你自己的私有群发一句），然后访问{' '}
+              <code>https://api.telegram.org/bot&lt;Token&gt;/getUpdates</code>
+              ，返回 JSON 里 <code>result[].message.chat.id</code> 即为 Chat ID。
+              私聊是正数、群组是负数（通常以 -100 开头）。
+            </>
+          }
+        />
+        <Button
+          icon={<SendOutlined />}
+          loading={tgTesting}
+          onClick={doTelegramTest}
+        >
+          发送测试消息
+        </Button>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+          测试会使用<strong>已保存</strong>的配置发送；改完 Token/Chat ID 请先点该项右侧的「保存」。
+        </Typography.Paragraph>
       </Card>
 
       {/* 注册策略 =================================================== */}

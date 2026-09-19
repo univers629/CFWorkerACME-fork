@@ -6,6 +6,7 @@ import * as agent from "./agent";
 import * as query from "./query";
 import {Bindings, D1Bindings} from './index'
 import {hmacSHA2} from "./users";
+import {notify} from "./notify";
 // 注意：这里曾经有一行 `import {errors} from "wrangler";`（实际从未使用）。
 // 它会让 esbuild 在打包 Worker 时去解析 wrangler 这个 10MB+ 的开发期 CLI 包，
 // 一旦安装时跳过了 devDependencies（npm ci --omit=dev），打包就会直接失败。
@@ -390,6 +391,15 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
     if (orders_data.status == "invalid") {
         await saves.updateDB(env.DB_CF, "Apply", {flag: -1}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发失败"}, {uuid: order_info['uuid']})
+        // 通知（失败不抛异常，不影响主流程）
+        await notify(env, {
+            event: "fail",
+            domains: await safeDomainNames(order_info),
+            mail: order_info['mail'],
+            uuid: order_info['uuid'],
+            detail: "ACME 侧返回 invalid，请检查域名解析或验证配置",
+            siteHost: await siteHostOf(env),
+        });
         return {"texts": "验证状态无效"};
     }
     if (orders_data.status === 'ready') {
@@ -417,8 +427,18 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
         await saves.updateDB(env.DB_CF, "Apply", {cert: certificate}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {flag: 5}, {uuid: order_info['uuid']})
         const timestamp = new Date(new Date().setDate(new Date().getDate() + 90)).getTime();
-        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp}, {uuid: order_info['uuid']})
+        // 新证书：清空到期提醒标记，让下个周期的 expire7/expired 能重新推送
+        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp, notified: ""}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {text: "恭喜！证书已成功签发"}, {uuid: order_info['uuid']})
+        // 通知（失败不抛异常，不影响主流程）
+        await notify(env, {
+            event: "success",
+            domains: await safeDomainNames(order_info),
+            mail: order_info['mail'],
+            uuid: order_info['uuid'],
+            detail: `有效期至 ${new Date(timestamp).toLocaleDateString('zh-CN')}`,
+            siteHost: await siteHostOf(env),
+        });
         // await saves.updateDB(env.DB, "Apply", {data: ""}, {uuid: order_info['uuid']})
     }
     return {"texts": "处理成功"};
@@ -499,6 +519,28 @@ async function getNames(order_info: any, full: boolean = false) {
         }
     }
     return domain_save;
+}
+
+/** 安全取域名列表：list 字段异常时返回空数组，绝不让通知逻辑拖垮主流程 */
+async function safeDomainNames(order_info: any): Promise<string[]> {
+    try {
+        const names = await getNames(order_info, false);
+        return Array.isArray(names) ? names as string[] : [];
+    } catch (e) {
+        console.warn("[notify] 解析域名列表失败", e);
+        return [];
+    }
+}
+
+/** 读取站点域名用于消息里的链接（读不到就返回空，消息里省略该行） */
+async function siteHostOf(env: D1Bindings): Promise<string | undefined> {
+    try {
+        const {readConf} = await import("./db/conf");
+        const host = (await readConf(env as any, "SITE_HOST")) ?? "";
+        return host || undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 // 获取操作接口 ####################################################################################

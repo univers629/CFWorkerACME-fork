@@ -33,6 +33,11 @@ const DEFAULT_CONFS: Record<string, string> = {
     NOTIFY_ON_FAIL: "true",
     NOTIFY_ON_EXPIRE7: "true",
     NOTIFY_ON_EXPIRED: "true",
+    // Telegram Bot 推送（参考 cloud-mail）---------------------------------
+    TG_BOT_ENABLED: "false",
+    TG_BOT_TOKEN: "",
+    // 支持多个会话：逗号 / 分号 / 空格分隔（群组 ID 为负数，形如 -1001234567890）
+    TG_CHAT_ID: "",
     // 人机验证 -----------------------------------------------------------
     CERT_CAPTCHA_ENABLED: "false",
     BASE_CAPTCHA_ENABLED: "false",
@@ -83,6 +88,7 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureConfsTable(dao);
         await ensureBaseTables(dao);
         await ensureUsersColumns(dao);
+        await ensureApplyColumns(dao);
         await seedDefaultConfs(dao);
         _migrated = true;
     } catch (e) {
@@ -156,6 +162,20 @@ async function ensureUsersColumns(dao: Dao): Promise<void> {
     if (!cols.includes("quota")) {
         await dao.exec(
             "ALTER TABLE Users ADD COLUMN quota INTEGER NOT NULL DEFAULT -1"
+        );
+    }
+}
+
+/**
+ * 检查 Apply 表是否已含 notified 字段，缺则补齐。
+ * 用途：记录该订单已推送过哪些到期提醒（如 "expire7"），避免每次 cron 都重复推送。
+ * 沿用 ensureUsersColumns 的「先查列名再 ALTER」策略，兼容 SQLite / D1 / MySQL。
+ */
+async function ensureApplyColumns(dao: Dao): Promise<void> {
+    const cols = await dao.columns("Apply");
+    if (!cols.includes("notified")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN notified TEXT DEFAULT ''"
         );
     }
 }

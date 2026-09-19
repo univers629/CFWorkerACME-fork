@@ -37,6 +37,8 @@ const ALLOWED_KEYS: string[] = [
     // 邮件 -----------------------------------------------
     "MAIL_ENABLED", "MAIL_KEYS", "MAIL_SEND",
     "NOTIFY_ON_SUCCESS", "NOTIFY_ON_FAIL", "NOTIFY_ON_EXPIRE7", "NOTIFY_ON_EXPIRED",
+    // Telegram 推送（TG_BOT_TOKEN 属密钥，只回显是否已配置）
+    "TG_BOT_ENABLED", "TG_BOT_TOKEN", "TG_CHAT_ID",
     // 注册策略 -------------------------------------------
     "REGISTER_ALLOW", "REGISTER_CODE", "DEFAULT_QUOTA",
     // 防滥用 ---------------------------------------------
@@ -68,6 +70,8 @@ const SECRET_KEYS = new Set<string>([
     "GTS_KeyTS",
     "SSL_KeyTS",
     "ZRO_KeyTS",
+    // Telegram Bot Token 等同密码：只返回 configured 布尔，不回显明文
+    "TG_BOT_TOKEN",
 ]);
 
 /** GET /admin/confs —— 一次性快照 */
@@ -232,6 +236,20 @@ export async function handleCaptchaTest(c: Context<AppEnv>): Promise<Response> {
     }
 }
 
+/**
+ * POST /admin/confs/telegram/test
+ * 用当前配置发一条测试消息，便于管理员在页面上直接验证 Token / Chat ID 是否可用。
+ */
+export async function handleTelegramTest(c: Context<AppEnv>): Promise<Response> {
+    const {sendTestTelegram} = await import("../notify");
+    try {
+        const r = await sendTestTelegram(c.env);
+        return c.json(r, r.flags === 0 ? 200 : 400);
+    } catch (e: any) {
+        return c.json({flags: 7, texts: "测试失败：" + (e?.message ?? String(e))}, 500);
+    }
+}
+
 /** 挂载 */
 export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/confs", adminMiddleware);
@@ -241,6 +259,7 @@ export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.delete("/admin/confs/:name", handleDeleteConf);
     app.post("/admin/confs/mail/test", handleMailTest);
     app.post("/admin/confs/captcha/test", handleCaptchaTest);
+    app.post("/admin/confs/telegram/test", handleTelegramTest);
 }
 
 export const ADMIN_CONF_KEYS = ALLOWED_KEYS;

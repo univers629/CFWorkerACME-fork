@@ -39,6 +39,8 @@ export interface ApplyRow {
     cert?: string | null;
     data?: string | null;
     text?: string | null;
+    /** 已推送过的到期提醒标记（如 "expire7,expired"），避免 cron 重复推送 */
+    notified?: string | null;
 }
 
 /** Confs 行 */
