@@ -97,11 +97,20 @@ jobs:
           echo "D1 数据库名：${D1_DATABASE_NAME_INPUT:-$NAME}"
           [ -n "${CUSTOM_DOMAIN:-}" ] && echo "自定义域名：$CUSTOM_DOMAIN" || echo "::warning::未设置 CUSTOM_DOMAIN，将只使用 workers.dev 地址"
 
-          for key in MAIL_KEYS MAIL_SEND AUTH_KEYS DCV_AGENT DCV_EMAIL DCV_TOKEN DCV_ZONES; do
+          # 这些不是「必需」，缺失只是功能不完整，所以只提示不阻断
+          for key in MAIL_KEYS MAIL_SEND; do
             if [ -z "${!key:-}" ]; then
-              echo "::warning::变量 $key 为空，部署后对应功能（发信 / DCV 自动验证 / 登录鉴权）不可用"
+              echo "::warning::$key 为空：注册 / 找回密码要发邮箱验证码，不配就注册不了用户（也可以在站点 /setup 向导里填）"
             fi
           done
+          for key in DCV_AGENT DCV_EMAIL DCV_TOKEN DCV_ZONES; do
+            if [ -z "${!key:-}" ]; then
+              echo "::warning::$key 为空：证书申请需要每次手动加 DNS TXT 记录，无法自动续期（也可以在站点系统管理里填）"
+            fi
+          done
+          if [ -z "${AUTH_KEYS:-}" ]; then
+            echo "::notice::AUTH_KEYS 为空：仅在开启人机验证（Turnstile）时才需要，默认关闭，不影响部署"
+          fi
 
       - name: 🚚 检出代码
         if: steps.preflight.outputs.skip != 'true'

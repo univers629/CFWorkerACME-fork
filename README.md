@@ -114,6 +114,7 @@
 | **`src/basic.ts` 变量清理** | Node/Docker 模式原来只透传 16 个与证书毫无关系的云盘变量（onedrive/baiduyun/115…），现在改为透传真实变量，且 `MAIL_KEYS` 与 `OPLIST_MAIL_KEYS` 两种写法都识别 |
 | **`.env.example` 补全** | 原来是 0 字节空文件，现在给出完整变量模板（数据源/邮件/鉴权/DCV/CA 四组） |
 | **`docker-compose.yml` 修正** | 服务名 `oplist-api-server` → `cfworker-acme`；原来直接拉上游镜像 `pikachuim/newssl:latest`，改为 `build: .` 用你自己的代码构建 |
+| **`DCV_TOKEN` 只认 Global API Key** | `src/agent.ts` 固定发 `X-Auth-Email` + `X-Auth-Key`，填 scoped API Token 会报 `6003 Invalid request headers` | 改为按 token 形态自动选择鉴权头，两种凭证都能用（推荐 scoped Token，权限可限定到单个域名） |
 
 ### 🤖 v2.3：内置 GitHub Actions 部署（参考 cloud-mail）
 
@@ -293,14 +294,81 @@ npm run deploy-cf:test
 | :--- | :---: | :--- |
 | `CLOUDFLARE_API_TOKEN` | ✅ | Cloudflare API 令牌，模板 `Edit Cloudflare Workers`，另加 `D1:Edit` |
 | `CLOUDFLARE_ACCOUNT_ID` | ✅ | Cloudflare 账户 ID（控制台右侧栏可复制） |
-| `MAIL_KEYS` / `MAIL_SEND` / `AUTH_KEYS` | ✅ | Resend 密钥 / 发件人 / 鉴权盐值 |
-| `DCV_AGENT` / `DCV_EMAIL` / `DCV_TOKEN` / `DCV_ZONES` | ✅ | DCV 自动验证代理（不填则只能手动加 DNS 记录） |
+| `MAIL_KEYS` / `MAIL_SEND` | ⭕ | Resend 密钥 / 发件人。**不填也能部署**，但注册/找回密码要邮箱验证码，等于没法注册 |
+| `AUTH_KEYS` | ⭕ | 人机验证 Secret（Turnstile）。只有开启验证码时才用，默认关闭 |
+| `DCV_AGENT` / `DCV_EMAIL` / `DCV_TOKEN` / `DCV_ZONES` | ⭕ | DCV 自动验证代理（不填则只能每次手动加 DNS TXT 记录） |
 | `NAME` | ❌ | Worker 名称，默认 `cfworker-acme` |
 | `D1_DATABASE_NAME` | ❌ | D1 库名，**留空 = 与 `NAME`（Worker 名）同名**；只在想沿用已有库时才显式指定 |
 | `D1_DATABASE_ID` | ❌ | 已有库的 UUID，填了就直接用它（最稳妥，不会误建新库）；不填则自动查同名库、没有就创建 |
-| `CUSTOM_DOMAIN` | ❌ | 用完自己的域名访问，例如 `acme.example.com` |
+| `CUSTOM_DOMAIN` | ❌ | 用完自己的域名访问，例如 `acme.example.com`；**留空则用 `xxx.workers.dev`** |
 | `SITE_HOST` / `SITE_TITLE` | ❌ | 站点域名与标题（影响邮件里的链接与页面标题） |
 | `GTS_*` / `SSL_*` / `ZRO_*` | ❌ | 各 CA 的 EAB 参数（`*_useIt` 填 `true` 表示启用） |
+
+#### 🔑 到底要准备几个令牌？
+
+| 令牌 | 数量 | 必需 | 说明 |
+| :--- | :---: | :---: | :--- |
+| Cloudflare API Token | **1 个** | ✅ | 部署用（见下表权限）。**这一个就够部署** |
+| Cloudflare Account ID | **1 个** | ✅ | 不是密钥，控制台右侧栏复制即可 |
+| Resend API Key | 1 个 | 想注册用户就要 | 免费注册 <https://resend.com> 拿 Key |
+| Cloudflare API Token（DNS） | 1 个 | 想自动续期就要 | 给 DCV 用，**可以和上面部署那个合并成同一个 Token**（多勾一个 `Zone → DNS → Edit`） |
+| CA 的 EAB（GTS/SSL/ZRO） | 每个 CA 一组 | ❌ | 不用 EAB 的 CA 可以直接跳过 |
+
+> 💡 **最少 1 个 Cloudflare API Token + 1 个 Account ID 就能部署成功**。
+> 其余都是「部署后想让功能完整」才需要。
+
+Cloudflare API Token 建议勾选（在 [API Tokens](https://dash.cloudflare.com/profile/api-tokens) 自定义模板）：
+
+| 权限 | 作用域 | 为什么需要 |
+| :--- | :--- | :--- |
+| `Workers Scripts` → **Edit** | Account | 部署 Worker（首次部署新 Worker 需要 `Admin` 级别的 Workers 权限） |
+| `Workers Routes` → **Edit** | Zone（你的域名） | 只有设了 `CUSTOM_DOMAIN` 才需要：自动建 DNS 记录 + 绑域名 |
+| `D1` → **Edit** | Account | 自动查/建 D1 数据库（[D1 文档](https://developers.cloudflare.com/d1/)） |
+| `Zone` → **DNS** → **Edit** | Zone（你的域名） | 只有要用 DCV 自动续期才需要 |
+
+> ⚠️ `Edit Cloudflare Workers` 这个官方模板**不含 D1 权限**（[模板权限表](https://developers.cloudflare.com/fundamentals/api/reference/template/)），
+> 所以要么在模板基础上手动加 `D1: Edit`，要么直接用自定义模板勾上面四项。
+> 不加也能部署：工作流会检测到建库失败，退回到 wrangler 的自动资源创建。
+
+#### 🌐 自定义域名：不用去 Cloudflare 后台点
+
+**Actions 会替你做完**——这正是参考 cloud-mail 的地方：
+
+```jsonc
+// wrangler.action.jsonc 里的这段，CUSTOM_DOMAIN 有值时才生效
+"routes": [{ "pattern": "${CUSTOM_DOMAIN}", "custom_domain": true }]
+```
+
+`custom_domain: true` 表示让 Cloudflare **自动创建 DNS 记录并签发边缘证书**，
+不需要你手动加 CNAME/A 记录，也不需要去 `Workers → Settings → Domains & Routes` 点添加
+（[Custom Domains 文档](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)）。
+
+前提条件只有两个：
+
+1. 这个域名（或其根域）**已经托管在同一个 Cloudflare 账号下**（即已是 active zone）；
+2. 你的 Token 有该 zone 的 `Workers Routes: Edit`（[权限说明](https://developers.cloudflare.com/workers/authorization/workers/)）。
+
+> 不设 `CUSTOM_DOMAIN` 也完全可用，只是地址是 `https://cfworker-acme.<你的子域>.workers.dev`。
+> 之后想加域名，补上这个变量再跑一次工作流即可，**不需要重新建库、数据不丢**。
+
+#### 🔐 管理员账号密码：在网站里设，不在 Cloudflare 后台
+
+**Cloudflare 侧只放"部署相关"的东西**（Token、Account ID、D1），
+站点自己的配置在**第一次打开网站时**由初始化向导 `/setup` 完成：
+
+| 向导里要填 | 对应变量 | 说明 |
+| :--- | :--- | :--- |
+| 站点域名 | `SITE_HOST` | 默认自动填当前访问的域名 |
+| 站点标题 | `SITE_TITLE` | 页面标题 |
+| 管理员邮箱 | — | **就是你的登录账号** |
+| 管理员密码 | — | **在这里设置**，前端 SHA256 后入库 |
+| 邮件功能开关 + Resend Key | `MAIL_KEYS` / `MAIL_SEND` | 也可以在向导里填 |
+
+流程：部署完成 → 打开站点 → 自动跳 `/setup` → 填完提交 → 跳登录页 → 用刚设的邮箱密码登录。
+**初始化标记 `INITIALIZED=true` 写入后该页面即失效**，所以密码要自己记牢。
+
+> 想改这些配置不用重新部署：登录后进 **系统管理 → 配置**（`/admin/confs`），
+> 邮件、DCV、注册策略、CA 凭据都能在线改，改完立即生效。
 
 > 条目可以放在 **Secrets** 或 **Variables** 里，两种都识别（敏感值建议用 Secrets）。
 > 没配 `CLOUDFLARE_API_TOKEN` 时工作流会**自动跳过**，不会给每次 push 挂红叉。
@@ -435,9 +503,22 @@ docker run -d --name certhub -p 3000:3000 \
 | 变量 | 必填 | 说明 | 获取 / 示例 |
 | :--- | :--: | :--- | :--- |
 | `DCV_AGENT` | ✅ | DCV 代理域名（**已托管在 Cloudflare 的根域名**） | `dcv.example.com` |
-| `DCV_EMAIL` | ✅ | Cloudflare 账号邮箱 | `user@example.com` |
-| `DCV_TOKEN` | ✅ | Cloudflare Global API Key 或具备 DNS 编辑权限的 Token | [API Tokens](https://dash.cloudflare.com/profile/api-tokens) |
+| `DCV_EMAIL` | ✅ | Cloudflare 账号邮箱（用 Global API Key 时必填；用 scoped Token 时可留空） | `user@example.com` |
+| `DCV_TOKEN` | ✅ | **Global API Key 或 scoped API Token 都支持**（自动识别，见下） | [API Tokens](https://dash.cloudflare.com/profile/api-tokens) |
 | `DCV_ZONES` | ✅ | `DCV_AGENT` 域名所属的 **Cloudflare Zone ID** | [Cloudflare Dashboard](https://dash.cloudflare.com/) → 域名概览右侧 |
+
+> 🔑 **`DCV_TOKEN` 两种凭证都能用**：程序按 token 形态自动选择鉴权头——
+> 37 位十六进制视为 Global API Key（用 `X-Auth-Email` + `X-Auth-Key`），
+> 其余（40 位 scoped Token）走 `Authorization: Bearer`。
+> 早期版本只会发 `X-Auth-Key`，把 scoped Token 填进去会直接报
+> `6003 Invalid request headers`；现已修复，推荐用 scoped Token：
+> 权限只需 `Zone → DNS → Edit`，且可以限定到具体域名。
+>
+> ⚠️ 注意 `DCV_ZONES` 要填的是**Zone ID**（32 位十六进制），不是域名。
+>
+> 💡 `DCV_AGENT` 不需要单独部署什么服务——它就是「你自己域名下的一个子域」，
+> 用来放 ACME 验证用的 TXT 记录（例如 `dcv.example.com`），
+> 用户在自己域名上 CNAME 到它即可，验证记录由本 Worker 通过 CF API 自动增删。
 
 ### 5️⃣ CA 厂商配置（XXX_*）
 

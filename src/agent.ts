@@ -9,6 +9,24 @@ async function dcv(env: Bindings, name: "DCV_ZONES" | "DCV_EMAIL" | "DCV_TOKEN")
     return (await readConf(env as any, name)) ?? "";
 }
 
+/**
+ * 构造 Cloudflare API 的鉴权头。
+ * -------------------------------------------------------------------------
+ * Cloudflare 有两套互不兼容的鉴权方式：
+ *   1. Global API Key（37 位十六进制）：`X-Auth-Email` + `X-Auth-Key`
+ *   2. API Token（40 位、可细粒度授权）：`Authorization: Bearer <token>`
+ * 把 scoped Token 塞进 X-Auth-Key 会被拒（6003 Invalid request headers），
+ * 所以这里按「有没有邮箱 + token 形态」自动选择，两种凭证都能用。
+ */
+function cfAuthHeaders(email: string, token: string): Record<string, string> {
+    const isGlobalKey = /^[0-9a-fA-F]{37}$/.test(token);
+    if (email && isGlobalKey) {
+        return {'X-Auth-Email': email, 'X-Auth-Key': token};
+    }
+    // 其余情况（scoped API Token，或只给了 token 没给邮箱）走 Bearer
+    return {'Authorization': `Bearer ${token}`};
+}
+
 export async function dnsAdd(env: Bindings, domain_item: any, domain_name: string) {
     const [zones, email, token] = await Promise.all([
         dcv(env, "DCV_ZONES"), dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN"),
@@ -17,8 +35,7 @@ export async function dnsAdd(env: Bindings, domain_item: any, domain_name: strin
         "POST", `https://api.cloudflare.com/client/v4/zones/${zones}/dns_records`,
         {
             'Content-Type': 'application/json',
-            'X-Auth-Email': email,
-            'X-Auth-Key': token,
+            ...cfAuthHeaders(email, token),
         },
         JSON.stringify({
             comment: 'DCV-Agent#' + Date.now() + '@' + domain_name,
@@ -55,10 +72,7 @@ export async function dnsAll(env: Bindings) {
     ]);
     return dnsAPI(
         "GET", `https://api.cloudflare.com/client/v4/zones/${zones}/dns_records`,
-        {
-            'X-Auth-Email': email,
-            'X-Auth-Key': token,
-        }, undefined)
+        cfAuthHeaders(email, token), undefined)
 }
 
 export async function uidDel(env: Bindings, domain_uuid: string) {
@@ -67,10 +81,7 @@ export async function uidDel(env: Bindings, domain_uuid: string) {
     ]);
     return dnsAPI(
         "DELETE", `https://api.cloudflare.com/client/v4/zones/${zones}/dns_records/${domain_uuid}`,
-        {
-            'X-Auth-Email': email,
-            'X-Auth-Key': token,
-        }, undefined)
+        cfAuthHeaders(email, token), undefined)
 }
 
 export async function dnsAPI(method: string = "POST",
