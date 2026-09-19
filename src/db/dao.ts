@@ -10,7 +10,7 @@
  *   - 参数化查询由各实现自行完成；上层禁止字符串拼接。
  */
 
-/** Users 行（按 schema.sql 字段映射） */
+/** Users 行（按 schema.set.sql 字段映射） */
 export interface UserRow {
     mail: string;
     flag: string;        // '0' | '1' | '2'

@@ -130,7 +130,7 @@ export const TURNSTILE_SITE_KEY = '0x4AAAAAABa7S19lK0Kn_TWK';
 export const GRAVATAR_BASE = 'https://www.gravatar.com/avatar/';
 
 // GitHub 仓库
-export const GITHUB_URL = 'https://github.com/PIKACHUIM/CFWorkerACME';
+export const GITHUB_URL = 'https://github.com/univers629/CFWorkerACME-fork';
 
 // 产品信息
 export const APP_NAME = 'CertHub';

@@ -18,7 +18,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// 用户表：与 schema.sql 结构保持一致（Prisma 使用 mail 作为主键）
+// 用户表：与 schema.set.sql 结构保持一致（Prisma 使用 mail 作为主键）
 model Users {
   mail     String  @id @unique
   flag     String  @default("0")

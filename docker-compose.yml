@@ -1,27 +1,30 @@
 version: '3'
 services:
-  oplist-api-server:
-    image: pikachuim/newssl:latest
-    container_name: ssl-helper
+  cfworker-acme:
+    # 用本地代码构建；改成 image: <你的用户名>/cfworker-acme:latest 也可以直接拉镜像
+    build: .
+    image: cfworker-acme:latest
+    container_name: cfworker-acme
     ports:
       - "3000:3000"
+    # 变量可以直接写原名（MAIL_KEYS），也可以沿用 OPLIST_ 前缀（两者都识别）
     environment:
-      - OPLIST_MAIL_KEYS="" # 替换为新的邮件密钥
-      - OPLIST_MAIL_SEND="" # 替换为邮件发送者
-      - OPLIST_AUTH_KEYS="" # 替换为认证密钥
-      - OPLIST_DCV_AGENT="" # 替换为 DCV 代理
-      - OPLIST_DCV_EMAIL="" # 替换为 DCV 邮件
-      - OPLIST_DCV_TOKEN="" # 替换为 DCV 令牌
-      - OPLIST_DCV_ZONES="" # 替换为 DCV 区域
-      - OPLIST_GTS_useIt="" # 替换为 GTS 使用标志
-      - OPLIST_GTS_keyMC="" # 替换为 GTS 密钥 MC
-      - OPLIST_GTS_keyID="" # 替换为 GTS 密钥 ID
-      - OPLIST_GTS_KeyTS="" # 替换为 GTS 密钥 TS
-      - OPLIST_SSL_useIt="" # 替换为 SSL 使用标志
-      - OPLIST_SSL_keyMC="" # 替换为 SSL 密钥 MC
-      - OPLIST_SSL_keyID="" # 替换为 SSL 密钥 ID
-      - OPLIST_SSL_KeyTS="" # 替换为 SSL 密钥 TS
-      - OPLIST_ZRO_useIt="" # 替换为 ZRO 使用标志
-      - OPLIST_ZRO_keyMC="" # 替换为 ZRO 密钥 MC
-      - OPLIST_ZRO_keyID="" # 替换为 ZRO 密钥 ID
-      - OPLIST_ZRO_KeyTS="" # 替换为 ZRO 密钥 TS
+      - MAIL_KEYS="" # 替换为新的邮件密钥
+      - MAIL_SEND="" # 替换为邮件发送者
+      - AUTH_KEYS="" # 替换为认证密钥
+      - DCV_AGENT="" # 替换为 DCV 代理
+      - DCV_EMAIL="" # 替换为 DCV 邮件
+      - DCV_TOKEN="" # 替换为 DCV 令牌
+      - DCV_ZONES="" # 替换为 DCV 区域
+      - GTS_useIt="" # 替换为 GTS 使用标志
+      - GTS_keyMC="" # 替换为 GTS 密钥 MC
+      - GTS_keyID="" # 替换为 GTS 密钥 ID
+      - GTS_KeyTS="" # 替换为 GTS 密钥 TS
+      - SSL_useIt="" # 替换为 SSL 使用标志
+      - SSL_keyMC="" # 替换为 SSL 密钥 MC
+      - SSL_keyID="" # 替换为 SSL 密钥 ID
+      - SSL_KeyTS="" # 替换为 SSL 密钥 TS
+      - ZRO_useIt="" # 替换为 ZRO 使用标志
+      - ZRO_keyMC="" # 替换为 ZRO 密钥 MC
+      - ZRO_keyID="" # 替换为 ZRO 密钥 ID
+      - ZRO_KeyTS="" # 替换为 ZRO 密钥 TS
