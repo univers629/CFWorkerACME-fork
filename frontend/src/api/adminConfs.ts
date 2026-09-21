@@ -43,3 +43,20 @@ export async function testCaptcha(token: string) {
 export async function testTelegram() {
   return await apiPost('/admin/confs/telegram/test', {});
 }
+
+export interface DcvCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface DcvTestResp {
+  flags: number;
+  texts?: string;
+  checks?: DcvCheck[];
+}
+
+/** 校验 DCV 配置（Token 有效性 / Zone 权限 / DCV_AGENT 归属 / DNS 读取） */
+export async function testDcv(): Promise<DcvTestResp> {
+  return (await apiPost('/admin/confs/dcv/test', {})) as DcvTestResp;
+}

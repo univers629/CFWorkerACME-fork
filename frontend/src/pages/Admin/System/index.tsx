@@ -31,6 +31,7 @@ import {
   DeleteOutlined,
   ExperimentOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
   SaveOutlined,
   SendOutlined,
 } from '@ant-design/icons';
@@ -41,6 +42,7 @@ import {
   testMail,
   testCaptcha,
   testTelegram,
+  testDcv,
 } from '@api/adminConfs';
 import { useBootstrapStore } from '@stores/useBootstrapStore';
 
@@ -122,6 +124,12 @@ export default function AdminSystemPage() {
 
   // Telegram 测试
   const [tgTesting, setTgTesting] = useState(false);
+
+  // DCV 配置检查
+  const [dcvTesting, setDcvTesting] = useState(false);
+  const [dcvChecks, setDcvChecks] = useState<
+    { name: string; ok: boolean; detail: string }[]
+  >([]);
 
   const fetchAll = async () => {
     setLoading(true);
@@ -421,8 +429,23 @@ export default function AdminSystemPage() {
     }
   };
 
-  const doCaptchaTest = async () => {
-    if (!captchaToken.trim()) {
+  const doDcvTest = async () => {
+    setDcvTesting(true);
+    try {
+      const res: any = await testDcv();
+      setDcvChecks(res?.checks ?? []);
+      if (res?.flags === 0) message.success(res?.texts || 'DCV 配置可用');
+      else message.error(res?.texts || 'DCV 配置存在问题');
+    } catch (e: any) {
+      // 400/500 响应体同样携带 checks，需读取后展示
+      setDcvChecks(e?.checks ?? []);
+      message.error(e?.texts || e?.message || '检查失败');
+    } finally {
+      setDcvTesting(false);
+    }
+  };
+
+  const doCaptchaTest = async () => {    if (!captchaToken.trim()) {
       message.error('请先在其它标签页获取一次验证码 token 并粘贴到此处');
       return;
     }
@@ -601,6 +624,38 @@ export default function AdminSystemPage() {
         {renderText('DCV_ZONES', 'DCV_ZONES', {
           help: '可留空：留空时按域名自动匹配 Zone。多个用逗号分隔。自动匹配需要 Token 具备 Zone:Read',
         })}
+        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+          <Button
+            size="small"
+            loading={dcvTesting}
+            onClick={doDcvTest}
+            icon={<SafetyCertificateOutlined />}
+          >
+            检查 DCV 配置
+          </Button>
+          {dcvChecks.length > 0 && (
+            <div>
+              {dcvChecks.map((chk, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'baseline',
+                    fontSize: 12,
+                    lineHeight: '20px',
+                  }}
+                >
+                  <span style={{ color: chk.ok ? '#52c41a' : '#ff4d4f' }}>
+                    {chk.ok ? '✓' : '✕'}
+                  </span>
+                  <span style={{ minWidth: 96 }}>{chk.name}</span>
+                  <span style={{ color: 'rgba(0,0,0,0.65)' }}>{chk.detail}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Space>
       </Card>
 
       {/* 证书提供商 · 三家 CA ==================================== */}

@@ -628,7 +628,17 @@ docker run -d --name certhub -p 3000:3000 \
 >
 > 💡 `DCV_AGENT` 无需单独部署服务，它是自有域名下的一个子域，
 > 用于存放 ACME 验证 TXT 记录（例如 `dcv.example.com`）。
-> 用户在自有域名上 CNAME 到该子域，验证记录由本 Worker 通过 CF API 自动增删。
+>
+> 🔁 **CNAME 由程序自动创建。** 申请 `dns-auto` 订单时，程序会在域名所属 Zone
+> 中建立 `_acme-challenge.<域名>` → `DCV_AGENT` 的 CNAME（代理关闭），
+> 验证记录由本 Worker 通过 CF API 自动增删，用户无需手工添加任何记录。
+> 若该记录已存在则保持原样，不覆盖用户的手工配置。
+> Token 需对该域名具备 `Zone → DNS → Edit` 权限；无权限时自动创建失败，
+> 此时可在订单详情页按提示手工添加 CNAME。
+>
+> 🩺 **配置自检**：系统管理 → DCV 卡片 → 「检查 DCV 配置」会逐项验证
+> Token 有效性、Zone 读取权限、`DCV_AGENT` 归属与 DNS 读取权限，
+> 无需通过真实订单试错。
 
 ### 5️⃣ 自动续期（AUTO_RENEW_*）
 

@@ -261,6 +261,128 @@ export async function handleTelegramTest(c: Context<AppEnv>): Promise<Response> 
     }
 }
 
+/**
+ * POST /admin/confs/dcv/test
+ * -------------------------------------------------------------------------
+ * 校验 DCV 配置是否可用，逐项返回诊断结果：
+ *   1. Token 是否有效（调用 /user/tokens/verify，Global Key 走 /user）
+ *   2. 是否具备 Zone:Read（能否列出 Zone）
+ *   3. DCV_AGENT 是否落在账号下某个 Zone 内
+ *   4. 能否在目标 Zone 中读写 DNS 记录
+ * 不回显 Token 明文。
+ */
+export async function handleDcvTest(c: Context<AppEnv>): Promise<Response> {
+    const env = c.env as any;
+    const {listZones, resolveZone} = await import("../zones");
+    const conf = await readConfMap(env, ["DCV_AGENT", "DCV_EMAIL", "DCV_TOKEN", "DCV_ZONES"]);
+    const token = String(conf.DCV_TOKEN ?? "").trim();
+    const email = String(conf.DCV_EMAIL ?? "").trim();
+    const agentHost = String(conf.DCV_AGENT ?? "").trim();
+
+    const checks: { name: string; ok: boolean; detail: string }[] = [];
+
+    if (!token) {
+        return c.json({flags: 5, texts: "尚未配置 DCV_TOKEN", checks}, 400);
+    }
+
+    // 鉴权头与 agent.ts 保持一致
+    const isGlobalKey = /^[0-9a-fA-F]{37}$/.test(token);
+    const headers: Record<string, string> = (email && isGlobalKey)
+        ? {"X-Auth-Email": email, "X-Auth-Key": token}
+        : {"Authorization": `Bearer ${token}`};
+    const authMode = (email && isGlobalKey) ? "Global API Key" : "API Token (Bearer)";
+
+    // 1) Token 有效性
+    try {
+        const url = isGlobalKey && email
+            ? "https://api.cloudflare.com/client/v4/user"
+            : "https://api.cloudflare.com/client/v4/user/tokens/verify";
+        const res = await fetch(url, {headers});
+        const body: any = await res.json();
+        if (body?.success) {
+            checks.push({name: "Token 有效性", ok: true, detail: `鉴权方式：${authMode}`});
+        } else {
+            const msg = body?.errors?.[0]?.message ?? `HTTP ${res.status}`;
+            checks.push({name: "Token 有效性", ok: false, detail: `鉴权失败：${msg}`});
+            return c.json({flags: 6, texts: "Token 无效：" + msg, checks}, 400);
+        }
+    } catch (e: any) {
+        checks.push({name: "Token 有效性", ok: false, detail: "请求失败：" + (e?.message ?? String(e))});
+        return c.json({flags: 7, texts: "无法连接 Cloudflare API", checks}, 500);
+    }
+
+    // 2) Zone:Read 权限
+    const zones = await listZones(env);
+    if (zones.length === 0) {
+        checks.push({
+            name: "Zone 读取权限",
+            ok: false,
+            detail: "无法列出任何 Zone：Token 缺少 Zone→Zone→Read，或账号下无域名",
+        });
+        if (!String(conf.DCV_ZONES ?? "").trim()) {
+            return c.json({
+                flags: 8,
+                texts: "缺少 Zone:Read 权限且未配置 DCV_ZONES，自动匹配无法工作",
+                checks,
+            }, 400);
+        }
+        checks.push({
+            name: "Zone 读取权限",
+            ok: true,
+            detail: "已配置 DCV_ZONES，跳过自动匹配",
+        });
+    } else {
+        checks.push({
+            name: "Zone 读取权限",
+            ok: true,
+            detail: `可读取 ${zones.length} 个 Zone：${zones.map((z) => z.name).slice(0, 5).join(", ")}`,
+        });
+    }
+
+    // 3) DCV_AGENT 归属
+    if (!agentHost) {
+        checks.push({name: "DCV_AGENT", ok: false, detail: "未配置，dns-auto 无法生成验证记录名"});
+    } else {
+        const zone = await resolveZone(env, agentHost);
+        if (zone) {
+            checks.push({
+                name: "DCV_AGENT",
+                ok: true,
+                detail: `${agentHost} 属于 Zone ${zone.name}`,
+            });
+            // 4) DNS 读写探测：只读一次记录列表，不做任何写入
+            try {
+                const res = await fetch(
+                    `https://api.cloudflare.com/client/v4/zones/${zone.id}/dns_records?per_page=1`,
+                    {headers}
+                );
+                const body: any = await res.json();
+                if (body?.success) {
+                    checks.push({name: "DNS 读取权限", ok: true, detail: "可在目标 Zone 读取 DNS 记录"});
+                } else {
+                    const msg = body?.errors?.[0]?.message ?? `HTTP ${res.status}`;
+                    checks.push({name: "DNS 读取权限", ok: false, detail: "读取失败：" + msg});
+                }
+            } catch (e: any) {
+                checks.push({name: "DNS 读取权限", ok: false, detail: "请求失败：" + (e?.message ?? String(e))});
+            }
+        } else {
+            checks.push({
+                name: "DCV_AGENT",
+                ok: false,
+                detail: `${agentHost} 不在账号下任何 Zone 内，验证记录将无法写入`,
+            });
+        }
+    }
+
+    const allOk = checks.every((x) => x.ok);
+    return c.json({
+        flags: allOk ? 0 : 9,
+        texts: allOk ? "DCV 配置可用" : "DCV 配置存在问题，详见检查项",
+        checks,
+    }, allOk ? 200 : 400);
+}
+
 /** 挂载 */
 export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/confs", adminMiddleware);
@@ -271,6 +393,7 @@ export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.post("/admin/confs/mail/test", handleMailTest);
     app.post("/admin/confs/captcha/test", handleCaptchaTest);
     app.post("/admin/confs/telegram/test", handleTelegramTest);
+    app.post("/admin/confs/dcv/test", handleDcvTest);
 }
 
 export const ADMIN_CONF_KEYS = ALLOWED_KEYS;

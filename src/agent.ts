@@ -52,15 +52,31 @@ async function zoneForRecord(env: Bindings, recordName: string): Promise<string>
     return "";
 }
 
+/** Cloudflare 对「已存在完全相同的记录」返回的错误；此时目标状态已达成，应视为成功 */
+const CF_ERR_IDENTICAL_EXISTS = 81057;
+
+/** 判断 dnsAPI 返回值是否表示「完全相同的记录已存在」 */
+function isIdenticalRecordError(res: any): boolean {
+    if (!res || res.success !== false) return false;
+    const errors: any[] = Array.isArray(res.errors) ? res.errors : [];
+    return errors.some((e) =>
+        Number(e?.code) === CF_ERR_IDENTICAL_EXISTS
+        || /identical record already exists|record already exists/i.test(String(e?.message ?? ""))
+    );
+}
+
 export async function dnsAdd(env: Bindings, domain_item: any, domain_name: string) {
     const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
-    const recordName = String(domain_item['auto'] ?? "");
+    const recordName = String(domain_item['auto'] ?? "").trim();
+    if (!recordName) {
+        return {success: false, errors: [{message: "验证记录名为空，请检查 DCV_AGENT 配置"}]};
+    }
     const zoneId = await zoneForRecord(env, recordName);
     if (!zoneId) {
         console.error(`[agent] 无法确定 ${recordName} 所属 Zone，跳过写入`);
         return {success: false, errors: [{message: "无法确定域名所属 Zone，请检查 DCV_ZONES 或 Token 的 Zone:Read 权限"}]};
     }
-    return dnsAPI(
+    const res = await dnsAPI(
         "POST", `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`,
         {
             'Content-Type': 'application/json',
@@ -72,35 +88,41 @@ export async function dnsAdd(env: Bindings, domain_item: any, domain_name: strin
             name: recordName,
             ttl: 60,
             type: 'TXT'
-        }))
+        }));
+    // 记录已存在且内容一致：无需重复写入，直接按成功处理，避免订单被误判为失败
+    if (isIdenticalRecordError(res)) {
+        console.log(`[agent] ${recordName} 已存在相同记录，视为写入成功`);
+        return {success: true, result: null, unchanged: true};
+    }
+    return res;
 }
 
+/** 删除指定记录名下的全部记录（同名多条时逐一删除） */
 export async function dnsDel(env: Bindings, domain_name: string, domain_type: string = "TXT") {
-    let domain_uuid: string = await dnsUID(env, domain_name, domain_type);
-    return await uidDel(env, domain_name, domain_uuid);
+    const name = String(domain_name ?? "").trim();
+    if (!name) return {success: false, errors: [{message: "记录名为空"}]};
+
+    const found = await findRecords(env, name, domain_type);
+    if (found.length === 0) return {success: false, errors: [{message: "记录不存在"}]};
+
+    let last: any = {success: true};
+    for (const rec of found) {
+        last = await uidDel(env, name, rec.id);
+    }
+    return last;
 }
 
-/**
- * 查找某条 DNS 记录的 ID。
- * @returns 记录 ID；未找到返回空串
- */
-export async function dnsUID(
-    env: Bindings, domain_name: string, domain_type: string = "TXT"
-): Promise<string> {
-    const found = await findRecord(env, domain_name, domain_type);
-    return found?.id ?? "";
-}
-
-/** 在所有候选 Zone 中查找记录，返回记录 ID 与所属 Zone */
-async function findRecord(
+/** 在所有候选 Zone 中查找同名同类型的全部记录 */
+async function findRecords(
     env: Bindings, domain_name: string, domain_type: string
-): Promise<{id: string; zoneId: string} | null> {
+): Promise<{id: string; zoneId: string}[]> {
     const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
 
     // 候选 Zone：优先按域名匹配，匹配不到再退回全部
     const matched = await resolveZone(env, domain_name);
     const zones = matched ? [matched] : await listZones(env);
 
+    const hits: {id: string; zoneId: string}[] = [];
     for (const z of zones) {
         const page = await dnsAPI(
             "GET",
@@ -109,11 +131,63 @@ async function findRecord(
         const rows: any[] = Array.isArray(page?.result) ? page.result : [];
         for (const item of rows) {
             if (item?.name === domain_name && item?.type === domain_type) {
-                return {id: String(item.id), zoneId: z.id};
+                hits.push({id: String(item.id), zoneId: z.id});
             }
         }
     }
-    return null;
+    return hits;
+}
+
+/**
+ * 为 dns-auto 域名自动创建 `_acme-challenge.<域名>` → `DCV_AGENT` 的 CNAME。
+ * -------------------------------------------------------------------------
+ * 验证链需要用户在自己的域名下把 `_acme-challenge` 指向 DCV_AGENT。
+ * 该记录只与域名相关、续期时不变，因此创建一次即可长期有效。
+ *
+ * 行为约定（全部为 best-effort，失败不影响主流程）：
+ *   - 已存在同类型记录时不做任何修改，返回 unchanged；
+ *   - 代理状态固定为关闭（DNS only），否则 ACME 服务器查不到 TXT；
+ *   - Token 对该域名无编辑权限时返回失败原因，由调用方决定是否提示用户。
+ */
+export async function cnameEnsure(
+    env: Bindings, domain_name: string, target: string
+): Promise<{success: boolean; unchanged?: boolean; errors?: any[]}> {
+    const host = String(domain_name ?? "").replace(/^\*\./, "").trim();
+    const dest = String(target ?? "").trim();
+    if (!host || !dest) {
+        return {success: false, errors: [{message: "域名或目标为空"}]};
+    }
+    const recordName = `_acme-challenge.${host}`;
+
+    const zone = await resolveZone(env, host);
+    if (!zone) {
+        return {success: false, errors: [{message: `无法确定 ${host} 所属 Zone`}]};
+    }
+
+    // 已存在则保持原样：用户可能已手工配置，不覆盖
+    const existing = await findRecords(env, recordName, "CNAME");
+    if (existing.length > 0) {
+        return {success: true, unchanged: true};
+    }
+
+    const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
+    const res = await dnsAPI(
+        "POST", `https://api.cloudflare.com/client/v4/zones/${zone.id}/dns_records`,
+        {
+            'Content-Type': 'application/json',
+            ...cfAuthHeaders(email, token),
+        },
+        JSON.stringify({
+            comment: 'DCV-Agent#' + Date.now() + '@' + host,
+            content: dest,
+            name: recordName,
+            proxied: false,
+            ttl: 60,
+            type: 'CNAME'
+        }));
+    if (isIdenticalRecordError(res)) return {success: true, unchanged: true};
+    // dnsAPI 在异常时返回 {}，统一补齐 success 字段供调用方判断
+    return {success: !!res?.success, errors: res?.errors};
 }
 
 /** 列出所有 Zone 下的 DNS 记录（合并结果） */

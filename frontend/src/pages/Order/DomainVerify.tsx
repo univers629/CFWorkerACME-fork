@@ -36,6 +36,7 @@ export default function DomainVerify({
           <DomainPanel
             key={i}
             domain={d}
+            orderFlag={order.flag}
             onVerify={() => onVerifySingle(d.name)}
           />
         ))}
@@ -46,15 +47,25 @@ export default function DomainVerify({
 
 function DomainPanel({
   domain,
+  orderFlag,
   onVerify,
 }: {
   domain: DomainItem;
+  orderFlag: number;
   onVerify: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const flag = domain.flag ?? 0;
   const pulseStatus = FLAG_PULSE[flag] || 'pending';
-  const isVerifiable = flag === 2;
+  /**
+   * 可验证的判定：
+   *   - 订单仍处于待验证(2)或验证中(3)阶段；
+   *   - 该域名自身尚未通过(flag < 4)。
+   * 仅按域名自身 flag===2 判定会让已进入验证中的域名失去按钮，
+   * 而验证是针对整张订单执行的，因此这里放宽到订单级状态。
+   */
+  const isVerifiable = (orderFlag === 2 || orderFlag === 3) && flag < 4;
+  const isDone = flag >= 4;
 
   const recordName = `_acme-challenge.${domain.name.replace(/^\*\./, '')}`;
   const recordType = domain.type === 'dns-auto' ? 'CNAME' : 'TXT';
@@ -131,7 +142,11 @@ function DomainPanel({
                   onClick={onVerify}
                   disabled={!isVerifiable}
                 >
-                  {isVerifiable ? '触发验证' : '耐心等待...'}
+                  {isDone
+                    ? '已完成'
+                    : isVerifiable
+                      ? '触发验证'
+                      : '耐心等待...'}
                 </Button>
               </div>
             </div>

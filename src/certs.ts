@@ -24,6 +24,42 @@ const acme_url_map: Record<string, any> = {
     "sslcom-trust": "https://acme.ssl.com/sslcom-dv-",
 }
 
+/** 等待若干毫秒（用于签发后的短轮询） */
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 订单处理互斥集合。
+ * -------------------------------------------------------------------------
+ * cron 的 Processing() 与手动「立即处理」都可能推进同一订单，并发进入会
+ * 重复生成私钥、重复提交 CSR。这里用模块级集合做同实例内的互斥。
+ * 局限：Workers 多实例部署时无法跨实例互斥；ACME 侧对重复 CSR 提交本身
+ * 是幂等的（同一订单只接受一次 finalize），因此该保护足以覆盖主要场景，
+ * 且无需为分布式锁引入额外的表与迁移。
+ */
+const _processing = new Set<string>();
+
+/** 尝试占用订单；返回释放函数，已被占用时返回 null */
+function acquireOrder(uuid: string): (() => void) | null {
+    if (_processing.has(uuid)) return null;
+    _processing.add(uuid);
+    return () => { _processing.delete(uuid); };
+}
+
+/**
+ * 判断 ACME 订单是否已过期。
+ * ACME 的 expires 为 RFC 3339 字符串；缺失或无法解析时视为未过期，
+ * 避免因字段异常把正常订单误判为失败。
+ */
+function isOrderExpired(orders_data: any): boolean {
+    const raw = orders_data?.expires;
+    if (!raw) return false;
+    const ts = new Date(String(raw)).getTime();
+    if (!Number.isFinite(ts)) return false;
+    return Date.now() > ts;
+}
+
 // 错误消息提取 ====================================================================================
 // 针对 acme-client / xior 抛出的错误对象，优先抽取 ACME Problem Details 中的友好信息，
 // 方便写入订单 text 字段后展示给用户。
@@ -129,18 +165,25 @@ export async function Processing(env: Bindings, ctx?: BackgroundContext) {
     let result: any[] = []
     for (const id in order_list) { // 获取信息 ==================================================================
         let order_info = order_list[id]; // 获取当前订单详细情况
-        let order_mail = order_info['mail']; // 当前订单用户邮箱
-        let order_user: any = await dao.getUser(order_mail); // 按不同阶段分配程序处理 ========================
-        if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
-        if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
-        if (order_info['flag'] == 2) {
-            // dns-auto 的域名由系统自己维护验证记录，直接推进验证；
-            // 其余（dns-self / web-self）传空数组，维持「等待人工」的原有语义。
-            const autos = autoVerifiableDomains(order_info);
-            result.push(await opDomain(env, order_user, order_info, autos));
-        }// 自动验证域名
-        if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
-        if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info, ctx));// 自动执行获取证书
+        // 跳过正被手动「立即处理」占用的订单，避免并发重复推进
+        const release = acquireOrder(order_info['uuid']);
+        if (!release) continue;
+        try {
+            let order_mail = order_info['mail']; // 当前订单用户邮箱
+            let order_user: any = await dao.getUser(order_mail); // 按不同阶段分配程序处理 ========================
+            if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
+            if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
+            if (order_info['flag'] == 2) {
+                // dns-auto 的域名由系统自己维护验证记录，直接推进验证；
+                // 其余（dns-self / web-self）传空数组，维持「等待人工」的原有语义。
+                const autos = autoVerifiableDomains(order_info);
+                result.push(await opDomain(env, order_user, order_info, autos));
+            }// 自动验证域名
+            if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
+            if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info, ctx));// 自动执行获取证书
+        } finally {
+            release();
+        }
     } // ========================================================================================================
     return result;
 }
@@ -152,6 +195,21 @@ export async function Processing(env: Bindings, ctx?: BackgroundContext) {
 // - flag=-1 失败
 // - 或中间某步 flag 未发生变化（避免死循环）
 export async function processOne(env: Bindings, order_uuid: string, ctx?: BackgroundContext) {
+    // 同一订单禁止并发处理（cron 与手动触发可能同时到达）
+    const release = acquireOrder(order_uuid);
+    if (!release) {
+        console.warn(`[certs] 订单 ${order_uuid} 正在处理中，跳过重复调用`);
+        return [{"texts": "订单正在处理中，请稍候"}];
+    }
+    try {
+        return await processOneLocked(env, order_uuid, ctx);
+    } finally {
+        release();
+    }
+}
+
+/** processOne 的实际执行体；调用前需已通过 acquireOrder 取得互斥 */
+async function processOneLocked(env: Bindings, order_uuid: string, ctx?: BackgroundContext) {
     let result: any[] = [];
     const dao = await ensureDao(env as any);
     // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
@@ -255,9 +313,23 @@ export async function setApply(env: Bindings, order_user: any, order_info: any) 
     let domain_save: any[] = []
     let domain_flag: number = 2
     let domain_text: string = ""
+    // 清理上一轮的验证记录。
+    // 新建订单的 list 中还没有 auto 字段，若只按 auto 删除会漏删，导致 dnsAdd
+    // 报「identical record already exists」。这里按同样的公式重算记录名，
+    // 保证无论 auto 是否已写入都能定位到旧记录。
+    const dcvAgentForClean = String((await readConf(env as any, "DCV_AGENT")) ?? "").trim();
     for (let domain_item of JSON.parse(domain_list)) {
-        if (domain_item['type'] == "dns-auto") {
-            await agent.dnsDel(env, domain_item['auto']); // 删除原来
+        if (domain_item['type'] != "dns-auto") continue;
+        const cleanName = dcvAgentForClean
+            ? (await hmacSHA2(String(domain_item.name).replaceAll("*.", ""), order_user['mail']))
+                .substring(0, 16) + "." + dcvAgentForClean
+            : String(domain_item['auto'] ?? "").trim();
+        if (!cleanName) continue;
+        try {
+            await agent.dnsDel(env, cleanName); // 删除原来
+        } catch (e) {
+            // 清理失败不应中断写入流程，后续 dnsAdd 会按实际情况报错
+            console.warn(`[certs] 清理旧验证记录失败 ${cleanName}`, e);
         }
     }
     for (let domain_item of JSON.parse(domain_list)) {
@@ -282,9 +354,29 @@ export async function setApply(env: Bindings, order_user: any, order_info: any) 
         domain_item.flag = 2
         if (domain_item['type'] == "dns-auto") {
             let domain_auto = await hmacSHA2(domain_name.replaceAll("*.", ""), order_user['mail'])
-            const dcvAgent = (await readConf(env as any, "DCV_AGENT")) ?? ""
+            const dcvAgent = String((await readConf(env as any, "DCV_AGENT")) ?? "").trim()
+            if (!dcvAgent) {
+                // 未配置 DCV_AGENT 时记录名会退化为 "<hash>."，属非法域名
+                domain_item.flag = 1
+                domain_flag = 1
+                domain_text += domain_item.name + ": 未配置 DCV_AGENT，无法生成验证记录名；"
+                domain_save.push(domain_item)
+                continue
+            }
             domain_item['auto'] = domain_auto.substring(0, 16) + "." + dcvAgent
             // console.log(domain_item['auto'])
+            // 自动建立 CNAME：用户无需再手工添加 _acme-challenge 记录。
+            // 失败不阻断流程（例如 Token 对该域名无编辑权限），此时仍按原有
+            // 方式提示用户在订单页手动配置。
+            try {
+                const cname = await agent.cnameEnsure(env, domain_name, domain_item['auto']);
+                if (!cname?.success) {
+                    const msg = cname?.errors?.[0]?.message ?? "未知原因";
+                    console.warn(`[certs] 自动创建 CNAME 失败 ${domain_name}: ${msg}`);
+                }
+            } catch (e) {
+                console.warn(`[certs] 自动创建 CNAME 异常 ${domain_name}`, e);
+            }
             try { // 设置域名内容 ====================================================
                 let data: Record<string, any> = await agent.dnsAdd(
                     env, domain_item, domain_name);
@@ -355,9 +447,12 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     let domain_fail: string[] = [];
     for (let domain_item of JSON.parse(domain_list)) { // 验证DNS
         // web-self（http-01验证）不需要DNS检查，直接提交验证
+        let lookup: query.DnsLookup | null = domain_item.type === "web-self"
+            ? null
+            : await dnsCheck(author_save, domain_item)
         let author_flag: boolean = domain_item.type === "web-self"
             ? (author_save[domain_item.name] != undefined)
-            : await dnsCheck(author_save, domain_item)
+            : !!lookup?.matched
         if (status_flag == -1) {
             domain_save.push(domain_item);
             continue
@@ -366,6 +461,12 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
         if (!author_flag) { // 本地验证失败 ========================================================
             domain_item.flag = 2;
             status_flag = 2
+            // 记录失败原因，供订单 text 字段展示
+            domain_fail.push(
+                lookup
+                    ? `${domain_item.name}: ${query.describeLookup(lookup)}`
+                    : `${domain_item.name}: 未获取到 ACME 验证挑战`
+            );
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
             if (author_data.data['status'] == "invalid") { // 已有验证失败
@@ -403,6 +504,9 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     if (status_flag == -1) await dao.updateApply(order_info['uuid'], {
         text: "域名验证失败:" + JSON.stringify(domain_fail)
     })
+    else if (status_flag == 2) await dao.updateApply(order_info['uuid'], {
+        text: "域名验证未通过：" + domain_fail.join("；")
+    })
     else await dao.updateApply(order_info['uuid'], {text: "域名验证通过"})
     return {"texts": "处理成功"};
 }
@@ -415,6 +519,14 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
     let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
     // console.log(orders_data);
     console.log('Orders Remote Verify Status:', orders_data.status);
+    // 订单已过期：ACME 侧不再接受验证或签发，回到 flag=0 重新下单。
+    // 不标记为失败，避免用户需要手动删除重建订单。
+    if (orders_data.status !== 'valid' && isOrderExpired(orders_data)) {
+        console.warn(`[certs] 订单已过期，重新创建 uuid=${order_info['uuid']} expires=${orders_data.expires}`);
+        await dao.updateApply(order_info['uuid'], {flag: 0})
+        await dao.updateApply(order_info['uuid'], {text: "ACME 订单已过期，正在重新创建"})
+        return {"texts": "订单已过期，重新创建"};
+    }
     if (orders_data.status == "invalid") {
         await dao.updateApply(order_info['uuid'], {flag: -1})
         await dao.updateApply(order_info['uuid'], {text: "证书签发失败"})
@@ -453,6 +565,19 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
         const finish_text: any = await client_data.finalizeOrder(orders_data, certificateCSR);// 最终确认订单
         console.log('Orders Remote Finish Status:', finish_text);
         await dao.updateApply(order_info['uuid'], {text: "证书签发请求提交成功"})
+
+        // CA 通常在数秒内完成签发，无需等到下一轮 cron。
+        // 这里短暂轮询若干次，签发完成则直接落到下方 valid 分支取回证书。
+        for (let attempt = 0; attempt < 5; attempt++) {
+            await sleep(2000);
+            try {
+                orders_data = await client_data.getOrder(orders_text);
+            } catch (e) {
+                console.warn(`[certs] 轮询订单状态失败 uuid=${order_info['uuid']}`, e);
+                break;
+            }
+            if (orders_data.status === 'valid' || orders_data.status === 'invalid') break;
+        }
     }
     if (orders_data.status === 'processing') {
         console.log('Orders Remote Finish Status:', "Certificate Processing");
@@ -704,8 +829,8 @@ async function getAuthy(client_data: any, orders_data: any) {
     return author_maps;
 }
 
-async function dnsCheck(author_save: any, domain_item: any) {
-    if (author_save[domain_item.name] == undefined) return false;
+async function dnsCheck(author_save: any, domain_item: any): Promise<query.DnsLookup | null> {
+    if (author_save[domain_item.name] == undefined) return null;
     // 设置数据 =============================================
     let domain_name = domain_item.name.replaceAll("*.", "")
     let author_text = domain_item.auth; // 目标解析记录
@@ -714,20 +839,8 @@ async function dnsCheck(author_save: any, domain_item: any) {
         domain_type = "CNAME" // 此时需检查CNAME而不是TXT记录
         author_text = domain_item.auto // 验证内容也改为CNAME
     } // 查询DNS ============================================
-    let author_flag: boolean = false // 任意一个DNS正确则通过
-    let record_list: any = await query.queryDNS(
-        "_acme-challenge." + domain_name, domain_type)
-    // console.log('Records for', domain_name, ':');
-    for (let record_item of record_list) { // 查询所有DNS记录
-        // console.log(record_item['data']);
-        // console.log(author_text);
-        if (record_item['data'] == author_text) {
-            author_flag = true;
-            break;
-        }
-    }
-    // console.log(author_flag);
-    return author_flag;
+    // 返回完整诊断信息（期望值 + 实际值），使失败原因能展示给用户
+    return await query.lookupDNS("_acme-challenge." + domain_name, domain_type, author_text);
 }
 
 async function dnsOrder(author_save: any, domain_item: any) {

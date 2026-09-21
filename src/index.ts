@@ -2,6 +2,9 @@ import {Context, Hono} from 'hono'
 import type {UserRow} from './db/dao'
 import {opDomain} from "./certs";
 import {cleanDNS} from "./query";
+import * as agent from "./agent";
+import {hmacSHA2} from "./users";
+import {readConf} from "./db/conf";
 import * as users from './users';
 import * as certs from './certs';
 import * as local from "hono/cookie";
@@ -176,6 +179,38 @@ async function countOwnOrderStats(
         dao.countApplies({and: [base, statusFilter("failed")!]}),
     ]);
     return {total, pending, verifying, signed, expired, failed};
+}
+
+/**
+ * 删除订单时清理其写入的 DCV 验证记录。
+ * -------------------------------------------------------------------------
+ * 记录名由「域名 + 用户邮箱」的 HMAC 前 16 位与 DCV_AGENT 拼接而成，
+ * 因此可以脱离订单数据重新算出，无需依赖 list 中的 auto 字段。
+ * 清理失败不影响订单删除，仅记录日志。
+ */
+async function cleanupOrderRecords(env: Bindings, order: Record<string, any> | undefined): Promise<void> {
+    if (!order) return;
+    try {
+        const agentHost = String((await readConf(env as any, "DCV_AGENT")) ?? "").trim();
+        if (!agentHost) return;
+        const mail = String(order['mail'] ?? "");
+        const list: any[] = JSON.parse(String(order['list'] ?? "[]"));
+        if (!Array.isArray(list)) return;
+        for (const d of list) {
+            if (d?.type !== "dns-auto") continue;
+            const name = String(d?.name ?? "").replace(/^\*\./, "");
+            if (!name) continue;
+            const hash = await hmacSHA2(name, mail);
+            const recordName = hash.substring(0, 16) + "." + agentHost;
+            try {
+                await agent.dnsDel(env, recordName);
+            } catch (e) {
+                console.warn(`[order] 清理验证记录失败 ${recordName}`, e);
+            }
+        }
+    } catch (e) {
+        console.warn("[order] 清理订单验证记录失败", e);
+    }
 }
 
 export const app = new Hono<AppEnv>()
@@ -404,8 +439,12 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                 await certs.processOne(c.env, order_uuid, c.executionCtx);
             } else if (order_acts === "reload")
                 await dao.updateApply(order_uuid, {flag: 0})
-            else if (order_acts === "modify" || order_acts === "cancel")
+            else if (order_acts === "modify" || order_acts === "cancel") {
+                // 删除订单前先清理它写入的 DCV 验证记录，否则记录会变成孤儿，
+                // 下次申请同域名时 dnsAdd 会因记录已存在而失败。
+                await cleanupOrderRecords(c.env, order_data[0]);
                 await dao.deleteApply(order_uuid)
+            }
             else if (order_acts === "single") {
                 order_acts += "-" + order_push
                 if (order_push == undefined || order_push == "undefined")
