@@ -30,6 +30,17 @@ export default {
             return;
         }
         try {
+            // 1) 自动续期扫描：把「即将到期且勾选了自动续期」的订单重置为 flag=0。
+            //    必须排在 Processing 之前，这样同一次 tick 就能继续把它推进下去。
+            const {scanAutoRenew} = await import('./renew');
+            const renewed = await scanAutoRenew({...env, DB_CF: env.DB_CF});
+            if (renewed.triggered > 0) {
+                console.log(`[cron] 自动续期触发 ${renewed.triggered} 个订单: ${renewed.uuids.join(', ')}`);
+            }
+            if (renewed.stuck > 0) {
+                console.log(`[cron] 自动续期卡在人工验证并已提醒 ${renewed.stuck} 个订单`);
+            }
+
             const certs = await import('./certs');
             const result = await certs.Processing({...env, DB_CF: env.DB_CF});
             console.log(`[cron] processed=${result.length} cost=${Date.now() - started}ms at ${controller.scheduledTime}`);

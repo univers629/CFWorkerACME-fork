@@ -49,6 +49,8 @@ const ALLOWED_KEYS: string[] = [
     "MONTHLY_APPLY_LIMIT",
     // 开放 API ------------------------------------------
     "API_RATE_LIMIT",
+    // 自动续期 ------------------------------------------
+    "AUTO_RENEW_ENABLED", "AUTO_RENEW_DAYS",
     // DCV（Cloudflare DNS 代理）------------------------
     "DCV_AGENT", "DCV_EMAIL", "DCV_TOKEN", "DCV_ZONES",
     // 证书提供商 · Google Trust Services --------------
@@ -73,6 +75,13 @@ const SECRET_KEYS = new Set<string>([
     // Telegram Bot Token 等同密码：只返回 configured 布尔，不回显明文
     "TG_BOT_TOKEN",
 ]);
+
+/** DCV 凭据变更后失效 Zone 缓存，否则最长后缀匹配会继续使用旧账号的 Zone 列表 */
+async function invalidateZoneCacheIfDcv(name: string): Promise<void> {
+    if (!name.startsWith("DCV_")) return;
+    const {invalidateZoneCache} = await import("../zones");
+    invalidateZoneCache();
+}
 
 /** GET /admin/confs —— 一次性快照 */
 export async function handleListConfs(c: Context<AppEnv>): Promise<Response> {
@@ -134,6 +143,7 @@ export async function handlePutConf(c: Context<AppEnv>): Promise<Response> {
 
     await writeConf(c.env as any, name, value);
     invalidateConf(name);
+    await invalidateZoneCacheIfDcv(name);
     return c.json({flags: 0, texts: "已保存"});
 }
 
@@ -144,6 +154,7 @@ export async function handleDeleteConf(c: Context<AppEnv>): Promise<Response> {
         return c.json({flags: 4, texts: "配置项不受管理"}, 400);
     }
     await removeConf(c.env as any, name);
+    await invalidateZoneCacheIfDcv(name);
     return c.json({flags: 0, texts: "已回退到 env/默认值"});
 }
 

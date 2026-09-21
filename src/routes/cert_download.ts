@@ -6,7 +6,7 @@
  *
  * 权限：
  *   - 证书拥有者（cookie 登录）或管理员；其余一律 403；
- *   - flag !== 5 或 cert/keys 为空 → 404；
+ *   - cert/keys 为空 → 404（不要求 flag=5，见 loadOrderForDownload）；
  *   - PFX 密码以 X-PFX-Password 响应头返回，仅一次，不入库不记日志。
  */
 
@@ -53,7 +53,9 @@ async function loadOrderForDownload(
         }
     }
 
-    if (Number(order.flag) !== 5 || !order.cert || !order.keys) {
+    // 只要求证书与私钥存在，不要求 flag=5：自动续期会把订单重置为 flag=0，
+    // 此时旧证书仍在服役，同步脚本必须仍能拉取。
+    if (!order.cert || !order.keys) {
         return c.json({flags: 6, texts: "证书尚未签发或已被清除"}, 404);
     }
     return order;

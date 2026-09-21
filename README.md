@@ -90,7 +90,7 @@
 | TypeScript 6 弃用 `baseUrl` | `frontend/tsconfig.json(28,5): error TS5101: Option 'baseUrl' is deprecated`，构建直接中断 | 去掉 `baseUrl`，`paths` 改为 `"./src/*"` 相对写法；根目录显式锁 `typescript@^5.9.3` |
 | Workers Sites 已废弃 | `wrangler.jsonc` 用 `site.bucket` + 代码里 `__STATIC_CONTENT_MANIFEST`，需要额外的 KV 命名空间 | 升级为 Workers 静态资源（`assets` + `not_found_handling: single-page-application` + `run_worker_first` API 前缀），静态文件不再经过 Worker |
 | D1 占位符导致部署失败 | `database_id: "<database-id>"` 不是合法 UUID，`wrangler deploy` 必失败 | 删除 `database_id`，交给 wrangler ≥4.45 的自动资源创建；已建库的用户把 ID 填回即可 |
-| 定时任务空转 | `scheduled()` 只打日志，Cloudflare 上的订单永远不会自动推进/续期 | `scheduled()` 改为调用 `certs.Processing(env)`，并区分 `*/5` 频率 |
+| 定时任务空转 | `scheduled()` 只打日志，Cloudflare 上的订单永远不会自动推进/续期 | `scheduled()` 改为调用 `certs.Processing(env)`；cron 频率由 `*/5` 调整为每小时 |
 | 依赖臃肿 | 装了 900+ 个包（`@serverless-devs/s`、`edgeone` 及其 CLI 依赖、已被弃用的 `request`） | `edgeone`/`@edgeone/ef-types` 降为 devDependencies，移除从未被引用的 `@serverless-devs/s` |
 | 部署按钮 404 | 按钮指向不存在的 `CFWorkerACMEs` | 修正为 `CFWorkerACME`，并补充 Fork 部署说明 |
 | Worker 里 import 了 `wrangler` | `src/certs.ts` 有一行从未使用的 `import {errors} from "wrangler"`，打包时要解析 10MB+ 的开发期 CLI 包；一旦安装跳过 devDependencies 就直接打包失败 | 删除该行 |
@@ -224,7 +224,7 @@ npm install        # npm workspaces：根依赖 + frontend/ 前端依赖一次�
     }
   ],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
-  "triggers": { "crons": ["*/5 * * * *"] }
+  "triggers": { "crons": ["0 * * * *"] }
 }
 ```
 
@@ -610,7 +610,7 @@ docker run -d --name certhub -p 3000:3000 \
 | `DCV_AGENT` | ✅ | DCV 代理域名（**已托管在 Cloudflare 的根域名**） | `dcv.example.com` |
 | `DCV_EMAIL` | ✅ | Cloudflare 账号邮箱（用 Global API Key 时必填；用 scoped Token 时可留空） | `user@example.com` |
 | `DCV_TOKEN` | ✅ | **Global API Key 或 scoped API Token 都支持**（自动识别，见下） | [API Tokens](https://dash.cloudflare.com/profile/api-tokens) |
-| `DCV_ZONES` | ✅ | `DCV_AGENT` 域名所属的 **Cloudflare Zone ID** | [Cloudflare Dashboard](https://dash.cloudflare.com/) → 域名概览右侧 |
+| `DCV_ZONES` | ❌ | Zone ID，**可留空**。留空时按域名自动匹配；多个用逗号分隔 | [Cloudflare Dashboard](https://dash.cloudflare.com/) → 域名概览右侧 |
 
 > 🔑 **`DCV_TOKEN` 两种凭证都能用**：程序按 token 形态自动选择鉴权头——
 > 37 位十六进制视为 Global API Key（用 `X-Auth-Email` + `X-Auth-Key`），
@@ -619,13 +619,41 @@ docker run -d --name certhub -p 3000:3000 \
 > `6003 Invalid request headers`；现已修复，推荐用 scoped Token：
 > 权限只需 `Zone → DNS → Edit`，且可以限定到具体域名。
 >
-> ⚠️ 注意 `DCV_ZONES` 要填的是**Zone ID**（32 位十六进制），不是域名。
+> 🌐 **多根域：`DCV_ZONES` 可留空。** 留空时程序调用 `GET /zones` 列出账号下所有
+> Zone，按**最长后缀匹配**定位所属 Zone（`a.sub.example.com` 命中
+> `sub.example.com` 而非 `example.com`），因此 `example.com`、`test.com`
+> 等多个根域可同时托管，无需手工抄写 Zone ID。
+> 自动匹配要求 Token 具备 `Zone → Zone → Read`；
+> 不具备该权限时仍可显式填写 Zone ID（支持多个，逗号分隔）。
 >
-> 💡 `DCV_AGENT` 不需要单独部署什么服务——它就是「你自己域名下的一个子域」，
-> 用来放 ACME 验证用的 TXT 记录（例如 `dcv.example.com`），
-> 用户在自己域名上 CNAME 到它即可，验证记录由本 Worker 通过 CF API 自动增删。
+> 💡 `DCV_AGENT` 无需单独部署服务，它是自有域名下的一个子域，
+> 用于存放 ACME 验证 TXT 记录（例如 `dcv.example.com`）。
+> 用户在自有域名上 CNAME 到该子域，验证记录由本 Worker 通过 CF API 自动增删。
 
-### 5️⃣ CA 厂商配置（XXX_*）
+### 5️⃣ 自动续期（AUTO_RENEW_*）
+
+> 申请页勾选「自动续期」的订单，会在到期前自动重新签发，无需人工干预。
+
+| 变量 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `AUTO_RENEW_ENABLED` | `true` | 总开关；设为 `false` 可整体停用自动续期 |
+| `AUTO_RENEW_DAYS` | `30` | 距到期不足该天数时触发续期 |
+
+> ⚙️ **工作原理**：cron 每小时扫描一次，命中窗口的订单被重置为 `flag=0`，
+> 由状态机重新走完「建单 → 验证 → 签发」，成功后刷新到期时间。
+>
+> 📅 **到期时间取自证书真实的 `notAfter`**（解析 X.509 有效期），
+> 不再假设「签发时间 + 90 天」——CA 的策略变化时提醒与续期窗口不会算错。
+>
+> ⚠️ **需要人工验证的订单不会被自动推进**：`dns-self` / `web-self` 仍会停在
+> `flag=2` 等待人工处理。此时若已临近到期，系统会推送一条
+> 「自动续期需要人工处理」的提醒，避免证书过期未被发现。
+>
+> 📥 **续期期间证书照常可下载**：下载接口不要求 `flag=5`，只要库中存在证书即返回，
+> 因此各服务器在续期窗口内不会拉不到证书。
+
+
+### 6️⃣ CA 厂商配置（XXX_*）
 
 每个 CA 都遵循 **`XXX_useIt` / `XXX_keyMC` / `XXX_keyID` / `XXX_KeyTS`** 的命名规则：
 
@@ -644,7 +672,44 @@ docker run -d --name certhub -p 3000:3000 \
 
 > 💡 **Let's Encrypt** 不需要 EAB，默认始终启用。但其在 Cloudflare Workers 上会出现 SSL 525 错误，需要使用 Nginx 反向代理（见下方[备注说明](#-备注说明)）。
 
-### 6️⃣ 完整变量速查表
+### 7️⃣ 多服务器共用同一张证书
+
+> 同一张证书供多台服务器使用时只签发一次，其余服务器定时拉取，避免各机器
+> 分别申请得到多张不同的证书。
+
+**第一步：签一张通配符证书**
+
+申请 `*.example.com` + `example.com`，验证方式选「TXT 自动验证」。
+`*.example.com` 覆盖全部一级子域，只需一条 `_acme-challenge.example.com` 的 CNAME，
+与各子域是否已添加解析无关。
+
+**第二步：每台服务器部署同步脚本**
+
+使用 [`scripts/sync-cert.sh`](scripts/sync-cert.sh)：填好文件顶部的配置，
+加入 dpanel「容器管理 → 计划任务」（执行容器留空，即在该容器内执行），
+或写入宿主机 crontab：
+
+```sh
+0 3 * * * /root/sync-cert.sh >> /var/log/sync-cert.log 2>&1
+```
+
+脚本流程：拉取证书 → 校验证书与私钥是否配对 → 内容变化时原子替换 →
+`nginx -s reload`。拉取失败时保留现有证书。
+
+**第三步：停掉其他服务器上的重复申请**
+
+各服务器自行申请的旧证书需要删除，否则仍会继续向 CA 申请。
+顺序为先确认域名已切换到通配符证书且访问正常，再删除旧证书。
+
+| 要点 | 说明 |
+| :--- | :--- |
+| 采用拉取而非推送 | dpanel 无长期 API Token（JWT 在服务重启后失效），推送需保存各机凭据并开放入站；拉取只需每台持一个只读 Token |
+| 证书路径 | dpanel 容器内 `/dpanel/acme/<域名>_ecc/`，文件名为 `fullchain.cer` 与 `<域名>.key` |
+| 首次准备 | 先用下载的 ZIP 在 dpanel「证书管理 → 手动上传」导入一次，生成目录与 `.conf` 元数据 |
+| 证书尚未签发时 | 脚本拉取失败并保留现状，不修改已有证书 |
+
+
+### 8️⃣ 完整变量速查表
 
 <details>
 <summary>📋 点击展开 / 收起 全部变量速查表</summary>
@@ -667,7 +732,9 @@ docker run -d --name certhub -p 3000:3000 \
 | DCV | `DCV_AGENT` | ✅ | DCV 代理根域名 |
 | DCV | `DCV_EMAIL` | ✅ | Cloudflare 账号邮箱 |
 | DCV | `DCV_TOKEN` | ✅ | Cloudflare API Key |
-| DCV | `DCV_ZONES` | ✅ | Cloudflare Zone ID |
+| DCV | `DCV_ZONES` | ❌ | Zone ID，可留空（留空时自动匹配）；多个用逗号分隔 |
+| 自动续期 | `AUTO_RENEW_ENABLED` | ❌ | 自动续期总开关（默认 `true`） |
+| 自动续期 | `AUTO_RENEW_DAYS` | ❌ | 提前多少天续期（默认 `30`） |
 | 站点 | `MAIN_URLS` | ❌ | 站点主域名（Node.js / Docker 模式邮件链接拼接用） |
 | CA · GTS | `GTS_useIt` / `GTS_keyMC` / `GTS_keyID` / `GTS_KeyTS` | ❌ | Google Trust Service |
 | CA · SSL | `SSL_useIt` / `SSL_keyMC` / `SSL_keyID` / `SSL_KeyTS` | ❌ | SSL.com |

@@ -47,6 +47,10 @@ model Apply {
   cert String?
   data String?
   text String?
+  /// 已推送过的到期提醒标记（如 "expire7,expired"），避免 cron 重复推送
+  notified String? @default("")
+  /// 续期期间暂存的新私钥，等新证书到手后与 cert 一起写入 keys
+  pending_keys String? @default("")
 }
 
 // 系统配置表

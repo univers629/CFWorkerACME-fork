@@ -77,7 +77,7 @@ export class PrismaDao implements Dao {
         const map: Record<string, string[]> = {
             Users: ["mail", "flag", "code", "keys", "pass", "apis", "time", "is_admin", "quota"],
             Apply: ["uuid", "mail", "sign", "type", "auto", "flag", "time", "next",
-                    "main", "list", "keys", "cert", "data", "text"],
+                    "main", "list", "keys", "cert", "data", "text", "notified", "pending_keys"],
             Confs: ["name", "data", "time"],
         };
         return map[table] ?? [];

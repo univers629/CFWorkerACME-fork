@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS Apply
     keys TEXT,
     cert TEXT,
     data TEXT,
-    text TEXT
+    text TEXT,
+    notified TEXT DEFAULT '',
+    pending_keys TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS Confs

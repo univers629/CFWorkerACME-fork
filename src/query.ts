@@ -1,6 +1,6 @@
 // 域名记录 #######################
 
-import {dnsAll, dnsAPI, uidDel} from "./agent";
+import {dnsAll, uidDel} from "./agent";
 // 注意：这里曾经有一行 `import {a} from "xior/xior-D_RKcIOK";`——它指向 xior 包的内部
 // 哈希文件名，既没有任何地方使用，也会随 xior 升级直接失效（TS2307）。已删除。
 
@@ -47,7 +47,15 @@ export async function queryDNS( // =========================================
 export async function cleanDNS(env: any) { // ===============
     let records: Record<string, any> | any = await dnsAll(env)
     let counter: number = 0;
-    const regex = /^[a-f0-9]+\.dcv\.524229\.xyz$/i;
+    // 只清理本系统写入的验证记录：<hex>.<DCV_AGENT>
+    const {readConf} = await import("./db/conf");
+    const agentHost = String((await readConf(env, "DCV_AGENT")) ?? "").trim();
+    if (!agentHost) {
+        console.warn("[clean] 未配置 DCV_AGENT，跳过清理");
+        return {"flag": false, "text": "未配置 DCV_AGENT，无法判断哪些记录属于本系统"};
+    }
+    const escaped = agentHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`^[a-f0-9]+\\.${escaped}$`, "i");
     if (records['result']) records = records['result']
     for (let single of records) {
         let rec_name: string = single['name'];
@@ -58,7 +66,8 @@ export async function cleanDNS(env: any) { // ===============
             let num_date = new Date(rec_date).getTime();
             let now_date = Date.now();
             if (Math.abs(now_date - num_date) >= 7 * 24 * 60 * 60 * 1000) {
-                await uidDel(env, rec_uuid)
+                // 传入记录名，让 uidDel 能定位到正确的 Zone（多根域场景）
+                await uidDel(env, rec_name, rec_uuid)
                 delete_t = "Deleted"
                 counter += 1
             }

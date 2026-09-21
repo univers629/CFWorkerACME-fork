@@ -21,7 +21,8 @@ export type NotifyEvent =
     | "success"   // 证书签发成功
     | "fail"      // 证书签发失败
     | "expire7"   // 证书 7 天内到期
-    | "expired";  // 证书已过期
+    | "expired"   // 证书已过期
+    | "renew_stuck"; // 自动续期已发起但卡在人工验证
 
 /** 事件 → 开关配置名 */
 const EVENT_SWITCH: Record<NotifyEvent, string> = {
@@ -29,6 +30,8 @@ const EVENT_SWITCH: Record<NotifyEvent, string> = {
     fail: "NOTIFY_ON_FAIL",
     expire7: "NOTIFY_ON_EXPIRE7",
     expired: "NOTIFY_ON_EXPIRED",
+    // 复用「即将到期」开关，不单独增加配置项
+    renew_stuck: "NOTIFY_ON_EXPIRE7",
 };
 
 /** 事件 → 中文标题 */
@@ -37,6 +40,7 @@ const EVENT_TITLE: Record<NotifyEvent, string> = {
     fail: "❌ 证书签发失败",
     expire7: "⏰ 证书即将到期",
     expired: "🚨 证书已过期",
+    renew_stuck: "⚠️ 自动续期需要人工处理",
 };
 
 export interface NotifyPayload {

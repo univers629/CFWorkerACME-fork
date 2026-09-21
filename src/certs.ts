@@ -12,6 +12,7 @@ import {notify} from "./notify";
 // 一旦安装时跳过了 devDependencies（npm ci --omit=dev），打包就会直接失败。
 // 已删除，不要加回来。
 import {readConf} from "./db/conf";
+import {parseCertValidity} from "./utils/certinfo";
 
 
 const acme_url_map: Record<string, any> = {
@@ -99,6 +100,26 @@ export function extractAcmeError(e: any): string {
     }
 }
 
+/**
+ * 取出订单中验证记录由系统自动维护的域名（type=dns-auto）。
+ * -------------------------------------------------------------------------
+ * 状态机走到 flag=2 时，若 opDomain 收到空的 sets_list 便不写库，订单会停在
+ * flag=2 直到用户手动点击验证。dns-auto 的记录由本系统增删，可直接推进。
+ * dns-self / web-self 需人工放置记录或文件，不在返回值中。
+ */
+export function autoVerifiableDomains(order_info: any): string[] {
+    try {
+        const list = JSON.parse(order_info['list'] ?? "[]");
+        if (!Array.isArray(list)) return [];
+        return list
+            .filter((d: any) => d?.type === "dns-auto" && Number(d?.flag ?? 0) < 4)
+            .map((d: any) => String(d?.name ?? ""))
+            .filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
 // 整体处理进程 ====================================================================================
 export async function Processing(env: D1Bindings) {
     let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
@@ -110,7 +131,12 @@ export async function Processing(env: D1Bindings) {
             env.DB_CF, "Users", {mail: {value: order_mail}}))[0]; // 按不同阶段分配程序处理 ========================
         if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
         if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
-        if (order_info['flag'] == 2) result.push(await opDomain(env, order_user, order_info, []));// 自动验证域名
+        if (order_info['flag'] == 2) {
+            // dns-auto 的域名由系统自己维护验证记录，直接推进验证；
+            // 其余（dns-self / web-self）传空数组，维持「等待人工」的原有语义。
+            const autos = autoVerifiableDomains(order_info);
+            result.push(await opDomain(env, order_user, order_info, autos));
+        }// 自动验证域名
         if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
         if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info));// 自动执行获取证书
     } // ========================================================================================================
@@ -412,7 +438,17 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
             altNames: domainsListCSR, commonName: domainsListCSR[0], country: order_info['C'], state: order_info['S'],
             locality: order_info['ST'], organization: order_info['O'], organizationUnit: order_info['OU']
         }, privateKeyText || "");
-        await saves.updateDB(env.DB_CF, "Apply", {keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+        // 新私钥先写入 pending_keys，不覆盖 keys：此时 cert 仍是上一张证书，
+        // 直接覆盖会让库中出现「新私钥 + 旧证书」的组合。
+        // 列不存在（迁移未执行）时退回旧行为，避免阻断签发。
+        try {
+            await saves.updateDB(env.DB_CF, "Apply", {pending_keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+        } catch (e) {
+            console.warn(
+                `[certs] pending_keys 写入失败，回退为直接写 keys（uuid=${order_info['uuid']}）`, e
+            );
+            await saves.updateDB(env.DB_CF, "Apply", {keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+        }
         const finish_text: any = await client_data.finalizeOrder(orders_data, certificateCSR);// 最终确认订单
         console.log('Orders Remote Finish Status:', finish_text);
         await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发请求提交成功"}, {uuid: order_info['uuid']})
@@ -424,9 +460,34 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
     if (orders_data.status === 'valid') {
         const certificate: any = await client_data.getCertificate(orders_data);// 获取证书
         // console.log('Orders Remote Issues Status:', certificate);
-        await saves.updateDB(env.DB_CF, "Apply", {cert: certificate}, {uuid: order_info['uuid']})
+        // cert 与 keys 必须**同一次写入**：只要二者不同步，下载端就可能拿到
+        // 不匹配的一对。pending_keys 是本轮 ready 阶段生成的新私钥；
+        // 若它缺失（老数据 / 异常中断）则保留原 keys，避免把私钥写没。
+        const pendingKeys = order_info['pending_keys'];
+        const hasPending = typeof pendingKeys === "string" && pendingKeys.length > 0;
+        await saves.updateDB(
+            env.DB_CF, "Apply",
+            hasPending
+                ? {cert: certificate, keys: pendingKeys, pending_keys: ""}
+                : {cert: certificate},
+            {uuid: order_info['uuid']}
+        );
+        if (!hasPending) {
+            console.warn(
+                `[certs] 订单 ${order_info['uuid']} 缺少 pending_keys，保留原私钥`
+            );
+        }
         await saves.updateDB(env.DB_CF, "Apply", {flag: 5}, {uuid: order_info['uuid']})
-        const timestamp = new Date(new Date().setDate(new Date().getDate() + 90)).getTime();
+        // 到期时间：优先用证书里真实的 notAfter（CA 不一定是 90 天，
+        // 例如 ZeroSSL/Google 的策略会变），解析失败才回退到 +90 天。
+        const validity = parseCertValidity(String(certificate ?? ""));
+        const timestamp = validity?.notAfter
+            ?? new Date(new Date().setDate(new Date().getDate() + 90)).getTime();
+        if (!validity) {
+            console.warn(
+                `[certs] 无法解析证书有效期 uuid=${order_info['uuid']}，回退为 +90 天`
+            );
+        }
         // 新证书：清空到期提醒标记，让下个周期的 expire7/expired 能重新推送
         await saves.updateDB(env.DB_CF, "Apply", {next: timestamp, notified: ""}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {text: "恭喜！证书已成功签发"}, {uuid: order_info['uuid']})

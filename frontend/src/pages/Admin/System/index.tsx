@@ -11,7 +11,6 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -514,6 +513,16 @@ export default function AdminSystemPage() {
         {renderBool('NOTIFY_ON_EXPIRE7', '证书过期前 7 天提醒')}
         {renderBool('NOTIFY_ON_EXPIRED', '证书已过期通知')}
         <Divider style={{ margin: '12px 0' }} />
+        {renderBool(
+          'AUTO_RENEW_ENABLED',
+          '自动续期',
+          '对申请时勾选了「自动续期」的订单生效',
+        )}
+        {renderNumber('AUTO_RENEW_DAYS', '提前续期天数', {
+          min: 1,
+          help: '距到期不足该天数时自动重新签发',
+        })}
+        <Divider style={{ margin: '12px 0' }} />
         <Button
           icon={<SendOutlined />}
           onClick={() => setMailTestOpen(true)}
@@ -534,50 +543,9 @@ export default function AdminSystemPage() {
           placeholder: '123456789:AA...',
         })}
         {renderText('TG_CHAT_ID', 'Chat ID', {
-          help: '接收消息的会话 ID，支持多个（用逗号分隔）；群组 ID 为负数，形如 -1001234567890',
+          help: '支持多个，逗号分隔。私聊为正数，群组为负数（-100 开头）；推送到群组时群成员可见消息内容',
           placeholder: '-1001234567890',
         })}
-        <Alert
-          type="success"
-          showIcon
-          style={{ marginBottom: 12 }}
-          message="消息只会发给下面配置的 Chat ID"
-          description={
-            <>
-              本系统<strong>不接收</strong>任何 Telegram 消息（没有 webhook，也不轮询
-              getUpdates），发送目标只有你在此处填写的 Chat ID。
-              因此即使别人搜到你的 Bot 用户名并点了 /start，他也<strong>收不到</strong>
-              任何推送——我们根本不知道他的 Chat ID。
-            </>
-          }
-        />
-        <Alert
-          type="warning"
-          showIcon
-          style={{ marginBottom: 12 }}
-          message="唯一要注意的：别把机器人拉进有外人的群"
-          description={
-            <>
-              推送到<strong>群组</strong>时，该群所有成员都能看到消息内容（含域名、
-              用户邮箱、订单号）。请只用<strong>自己的私聊</strong>或<strong>只有你自己的私有群</strong>。
-              建议在 @BotFather 里用 <code>/setjoingroups</code> 禁止他人把机器人拉进群。
-            </>
-          }
-        />
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginBottom: 12 }}
-          message="怎么拿到 Chat ID？"
-          description={
-            <>
-              先私聊机器人发一句话（或把它拉进你自己的私有群发一句），然后访问{' '}
-              <code>https://api.telegram.org/bot&lt;Token&gt;/getUpdates</code>
-              ，返回 JSON 里 <code>result[].message.chat.id</code> 即为 Chat ID。
-              私聊是正数、群组是负数（通常以 -100 开头）。
-            </>
-          }
-        />
         <Button
           icon={<SendOutlined />}
           loading={tgTesting}
@@ -585,9 +553,6 @@ export default function AdminSystemPage() {
         >
           发送测试消息
         </Button>
-        <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-          测试会使用<strong>已保存</strong>的配置发送；改完 Token/Chat ID 请先点该项右侧的「保存」。
-        </Typography.Paragraph>
       </Card>
 
       {/* 注册策略 =================================================== */}
@@ -618,7 +583,7 @@ export default function AdminSystemPage() {
           help: 'Cloudflare Global API Key / Key Token',
         })}
         {renderText('DCV_ZONES', 'DCV_ZONES', {
-          help: '托管 DCV 子域的 Zone ID',
+          help: '可留空：留空时按域名自动匹配 Zone。多个用逗号分隔。自动匹配需要 Token 具备 Zone:Read',
         })}
       </Card>
 
@@ -740,9 +705,7 @@ export default function AdminSystemPage() {
         destroyOnClose
       >
         <Typography.Paragraph>
-          请粘贴一个由当前 provider 生成的 <code>response token</code>
-          。 本接口仅使用服务端 secret 发起一次真实校验请求，用于验证 secret
-          配置是否正确。
+          粘贴一个由当前 provider 生成的 response token，用于校验 secret 是否正确。
         </Typography.Paragraph>
         <Input.TextArea
           rows={3}

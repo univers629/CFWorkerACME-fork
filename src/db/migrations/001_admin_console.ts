@@ -52,6 +52,10 @@ const DEFAULT_CONFS: Record<string, string> = {
     MONTHLY_APPLY_LIMIT: "0",
     // 开放 API 速率限制（次/分钟） --------------------------------------
     API_RATE_LIMIT: "60",
+    // 自动续期 ---------------------------------------------------------
+    // 仅对申请时勾选了自动续期的订单生效（Apply.auto=1）
+    AUTO_RENEW_ENABLED: "true",
+    AUTO_RENEW_DAYS: "30",
     // DCV（Cloudflare DNS 代理）----------------------------------------
     DCV_AGENT: "",
     DCV_EMAIL: "",
@@ -89,6 +93,7 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureBaseTables(dao);
         await ensureUsersColumns(dao);
         await ensureApplyColumns(dao);
+        await ensureIndexes(dao);
         await seedDefaultConfs(dao);
         _migrated = true;
     } catch (e) {
@@ -177,6 +182,40 @@ async function ensureApplyColumns(dao: Dao): Promise<void> {
         await dao.exec(
             "ALTER TABLE Apply ADD COLUMN notified TEXT DEFAULT ''"
         );
+    }
+    // pending_keys：续期期间暂存新私钥，避免出现「新私钥 + 旧证书」的组合。
+    if (!cols.includes("pending_keys")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN pending_keys TEXT DEFAULT ''"
+        );
+    }
+}
+
+/**
+ * 建索引。
+ * -------------------------------------------------------------------------
+ * flag=5（已签发）占订单表绝大多数，索引选择性差，实测 2000 行表上读取行数
+ * 仅从 2000 降到 1995。日读取量的主要来源是 cron 频率（见 wrangler.jsonc）。
+ * 保留索引的理由：flag=2 等少数态查询能命中，订单列表与配额统计按 mail
+ * 过滤也有收益；写入时多维护一行，代价可忽略。
+ * 使用 IF NOT EXISTS 保证幂等，失败时退化为全表扫描，不影响主流程。
+ */
+async function ensureIndexes(dao: Dao): Promise<void> {
+    // flag：cron 的三次扫描均按 flag 过滤（flag=5 / flag=2 / flag!=5）
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_flag ON Apply(flag)"
+        );
+    } catch (e) {
+        console.warn("[migrations] 建 idx_apply_flag 失败（查询将退化为全表扫描）", e);
+    }
+    // mail：订单列表、配额统计按用户过滤
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_mail ON Apply(mail)"
+        );
+    } catch (e) {
+        console.warn("[migrations] 建 idx_apply_mail 失败", e);
     }
 }
 

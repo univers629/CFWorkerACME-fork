@@ -41,6 +41,13 @@ export interface ApplyRow {
     text?: string | null;
     /** 已推送过的到期提醒标记（如 "expire7,expired"），避免 cron 重复推送 */
     notified?: string | null;
+    /**
+     * 续期过程中新生成、尚未配套新证书的私钥。
+     * ACME 状态 ready 时生成私钥、valid 时才拿到证书，直接覆盖 keys 会让
+     * 库中短暂出现「新私钥 + 旧证书」的组合。新私钥先存此处，证书到手后
+     * 与 cert 同一次写入 keys。
+     */
+    pending_keys?: string | null;
 }
 
 /** Confs 行 */

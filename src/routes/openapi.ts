@@ -187,10 +187,13 @@ async function handleGetOrder(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const row = await ownsApply(dao, user, uuid);
     if (!row) return c.json({code: "NOT_FOUND", message: "订单不存在或无权访问"}, 404);
+    // 仅返回可公开字段：整行展开会连带输出 cert / keys / pending_keys 的私钥明文
     return c.json({
         code: "OK",
         item: {
-            ...row,
+            uuid: row.uuid, flag: row.flag, time: row.time, next: row.next,
+            sign: row.sign, type: row.type, auto: row.auto,
+            main: row.main, list: row.list, text: row.text,
             has_cert: !!(row.cert && row.cert.length > 0),
             has_keys: !!(row.keys && row.keys.length > 0),
         },
@@ -204,7 +207,8 @@ async function handleDownloadPem(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const row = await ownsApply(dao, user, uuid);
     if (!row) return c.json({code: "NOT_FOUND", message: "订单不存在或无权访问"}, 404);
-    if (Number(row.flag) !== 5 || !row.cert) {
+    // 不要求 flag=5：自动续期会把订单重置为 flag=0，此时旧证书仍在服役
+    if (!row.cert) {
         return c.json({code: "NOT_READY", message: "证书尚未签发或已被清除"}, 404);
     }
     return c.json({
@@ -220,7 +224,8 @@ async function handleDownloadZip(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const row = await ownsApply(dao, user, uuid);
     if (!row) return c.json({code: "NOT_FOUND", message: "订单不存在或无权访问"}, 404);
-    if (Number(row.flag) !== 5 || !row.cert || !row.keys) {
+    // 不要求 flag=5（同 handleDownloadPem）
+    if (!row.cert || !row.keys) {
         return c.json({code: "NOT_READY", message: "证书尚未签发或已被清除"}, 404);
     }
     const {leaf, chain} = splitCertChain(row.cert);
@@ -247,7 +252,8 @@ async function handleDownloadPfx(c: Context<AppEnv>): Promise<Response> {
     const dao = await ensureDao(c.env as any);
     const row = await ownsApply(dao, user, uuid);
     if (!row) return c.json({code: "NOT_FOUND", message: "订单不存在或无权访问"}, 404);
-    if (Number(row.flag) !== 5 || !row.cert || !row.keys) {
+    // 不要求 flag=5（同 handleDownloadPem）
+    if (!row.cert || !row.keys) {
         return c.json({code: "NOT_READY", message: "证书尚未签发或已被清除"}, 404);
     }
     // 生成随机 12 位密码
