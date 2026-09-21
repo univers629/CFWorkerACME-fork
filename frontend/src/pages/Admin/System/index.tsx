@@ -103,6 +103,12 @@ export default function AdminSystemPage() {
   const [items, setItems] = useState<Items>({});
   const [secretKeys, setSecretKeys] = useState<Set<string>>(new Set());
   const [dirty, setDirty] = useState<Touched>({});
+  /**
+   * 敏感项的待提交内容。
+   * 服务端对敏感项只返回 { configured }，不回显明文；用户输入若直接写进 items
+   * 会覆盖该标记，导致「已配置」状态丢失。因此草稿单独存放。
+   */
+  const [secretDraft, setSecretDraft] = useState<Record<string, string>>({});
 
   // 邮件测试弹窗
   const [mailTestOpen, setMailTestOpen] = useState(false);
@@ -125,6 +131,7 @@ export default function AdminSystemPage() {
         setItems(res.items);
         setSecretKeys(new Set(res.secret_keys));
         setDirty({});
+        setSecretDraft({});
       } else {
         message.error(res.texts || '加载失败');
       }
@@ -141,17 +148,31 @@ export default function AdminSystemPage() {
   }, []);
 
   const markDirty = (name: string, value: any) => {
-    setItems((prev) => ({ ...prev, [name]: value }));
+    if (secretKeys.has(name)) {
+      // 敏感项写入独立草稿，保留 items[name] 的 { configured } 标记
+      setSecretDraft((prev) => ({ ...prev, [name]: String(value ?? '') }));
+    } else {
+      setItems((prev) => ({ ...prev, [name]: value }));
+    }
     setDirty((prev) => ({ ...prev, [name]: true }));
   };
 
   const onSaveOne = async (name: string) => {
     try {
-      const raw = items[name];
+      const raw = secretKeys.has(name) ? secretDraft[name] : items[name];
+      if (secretKeys.has(name) && (raw === undefined || raw === '')) {
+        message.warning('内容为空，未提交');
+        return;
+      }
       const res: any = await saveAdminConf(name, raw);
       if (res?.flags === 0) {
         message.success(`${name} 已保存`);
         setDirty((prev) => ({ ...prev, [name]: false }));
+        if (secretKeys.has(name)) {
+          // 清空草稿并就地标记为已配置，避免整表重载丢弃其它未保存的修改
+          setSecretDraft((prev) => ({ ...prev, [name]: '' }));
+          setItems((prev) => ({ ...prev, [name]: { configured: true } }));
+        }
         // 若保存影响 bootstrap 返回值（站点标题、邮件开关、验证码、注册策略）
         refreshBootstrap();
       } else {
@@ -219,11 +240,14 @@ export default function AdminSystemPage() {
     opts?: { help?: string; placeholder?: string; textarea?: boolean },
   ) => {
     const isSecret = secretKeys.has(name);
-    const configured =
-      isSecret && typeof items[name] === 'object'
-        ? !!items[name]?.configured
-        : undefined;
-    const val = isSecret ? '' : (items[name] ?? '');
+    // 敏感项：items[name] 为 { configured }，明文只存在于 secretDraft
+    const configured = isSecret ? !!items[name]?.configured : undefined;
+    const val = isSecret ? (secretDraft[name] ?? '') : (items[name] ?? '');
+    const placeholder = isSecret
+      ? configured
+        ? '已配置；留空表示不修改'
+        : '尚未配置，请粘贴后保存'
+      : opts?.placeholder;
     return (
       <Row align="top" gutter={12} style={{ marginBottom: 12 }}>
         <Col flex="220px">
@@ -246,22 +270,14 @@ export default function AdminSystemPage() {
             <Input.TextArea
               rows={3}
               value={val}
-              placeholder={
-                isSecret ? '（保持为空表示不修改）' : opts?.placeholder
-              }
-              onChange={(e) => markDirty(name, e.target.value)}
-            />
-          ) : isSecret ? (
-            <Input.Password
-              value={val}
-              placeholder="（保持为空表示不修改）"
+              placeholder={placeholder}
               onChange={(e) => markDirty(name, e.target.value)}
               autoComplete="off"
             />
           ) : (
             <Input
               value={val}
-              placeholder={opts?.placeholder}
+              placeholder={placeholder}
               onChange={(e) => markDirty(name, e.target.value)}
               autoComplete="off"
             />
