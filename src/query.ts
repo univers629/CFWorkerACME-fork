@@ -14,31 +14,52 @@ interface DnsResponse {
     };
 }
 
+/**
+ * 公共 DoH 解析器候选列表，按可靠性排序。
+ * 单一解析器会因负缓存返回空结果：记录刚创建时解析器已缓存「不存在」，
+ * 在缓存过期前持续回答无记录，导致验证被误判为失败。
+ * 逐个尝试可显著降低误判概率。
+ */
+const DOH_SERVERS: string[] = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+];
+
 // 解析域名 ################################################################
 export async function queryDNS( // =========================================
     domain: string,/* 待查询的域名 */ record: string = "TXT", // 查询类型TXT
-    server: string = "https://dns.google/resolve"): Promise<DnsResponse[]> {
+    server?: string): Promise<DnsResponse[]> {
+    const servers = server ? [server] : DOH_SERVERS;
+    for (const srv of servers) {
+        const rows = await queryOne(srv, domain, record);
+        // 任一解析器返回了记录即认为存在；全部为空才判定为不存在
+        if (rows.length > 0) return rows;
+    }
+    return [];
+}
+
+/** 向单个 DoH 解析器发起查询；任何异常都返回空数组 */
+async function queryOne(server: string, domain: string, record: string): Promise<DnsResponse[]> {
     // 查询参数设置 ========================================================
     const params = new URLSearchParams({name: domain, type: record}); // URL
-    console.log(`${server}?${params}`);
     try { // 查询过程 ======================================================
-        const response = await fetch(`${server}?${params}`);
+        const response = await fetch(`${server}?${params}`, {
+            headers: {"accept": "application/dns-json"},
+            signal: AbortSignal.timeout(8000),
+        });
         if (!response.ok) { // 如果查询失败了 ==============================
-            console.error(`查询域名失败: ${response.status}`);
+            console.error(`查询域名失败 ${server}: ${response.status}`);
             return []; // 返回空数据保证不异常 =============================
         } // 解析查询数据 ==================================================
         const data: any = await response.json();
-        console.log(data);
         if (!data.Answer) return [];
-        let txtRecords: any = data.Answer.map( // 映射查询数据 ======
+        return data.Answer.map( // 映射查询数据 ======
             (r: any) => ({
                 name: r.name, type: r.type, time: r.TTL,
                 data: r.data.endsWith('.') ? r.data.substring(0, r.data.length - 1) : r.data,
             }));
-        // console.log("txtRecords: ", txtRecords);
-        return txtRecords || [];
     } catch (error) {
-        console.error('解析数据失败:', error);
+        console.error(`解析数据失败 ${server}:`, error);
         return [];
     }
 }
