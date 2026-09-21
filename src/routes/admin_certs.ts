@@ -25,12 +25,15 @@ function appendText(old: string | null | undefined, extra: string): string {
     return base + prefix + extra;
 }
 
-/** 统一返回结构：ApplyRow 原样（包含 cert 与 keys？注意这里是管理员视角） */
+/**
+ * 单条订单的管理员视图：保留 cert / keys 原文。
+ * 列表接口改用 DAO 的摘要投影，不返回这些大字段。
+ */
 function publicApply(r: ApplyRow): any {
-    // 管理员视图不过滤 cert/keys —— 但出于最小暴露原则，在列表接口不返回这些大字段
     return r;
 }
 
+/** 剔除 cert / keys / data，仅保留是否存在的标记 */
 function briefApply(r: ApplyRow): any {
     const {keys, cert, data, ...rest} = r;
     return {
@@ -57,7 +60,7 @@ export async function handleListCerts(c: Context<AppEnv>): Promise<Response> {
     if (q.next_from) filter.gte!["next"] = Number(q.next_from);
     if (q.next_to) filter.lte!["next"] = Number(q.next_to);
 
-    const {rows, total} = await dao.listApplies(filter, {
+    const {rows, total} = await dao.listApplySummaries(filter, {
         page, pageSize, orderBy: "time", orderDesc: true,
     });
 
@@ -66,7 +69,8 @@ export async function handleListCerts(c: Context<AppEnv>): Promise<Response> {
         total,
         page,
         page_size: pageSize,
-        items: rows.map(briefApply),
+        // has_cert / has_keys 在 SQL 中为 0/1，统一转成布尔以匹配前端类型
+        items: rows.map((r) => ({...r, has_cert: !!r.has_cert, has_keys: !!r.has_keys})),
     });
 }
 

@@ -40,15 +40,23 @@ export function normalizeDbSource(value?: string): DbSource {
 // 模块级单例缓存（每个 Worker 实例内共享）
 let _cachedDao: Dao | null = null;
 let _cachedSource: string | null = null;
+let _cachedBinding: unknown = null;
 
 /**
- * 获取当前 DAO 实例。**业务代码统一从此函数取 DAO**，禁止直接 `env.DB_CF.prepare()`。
+ * 获取当前 DAO 实例。业务代码统一从此函数取 DAO，禁止直接 `env.DB_CF.prepare()`。
+ *
+ * 缓存键包含底层绑定对象本身：同一个 Worker 实例通常只有一个 D1 绑定，
+ * 但测试或多次注入不同绑定时必须重建，否则会串用上一个数据库。
  */
 export function getDao(env: DbEnv): Dao {
     const source = normalizeDbSource(env.DB_SOURCE);
-    // 不同 source 切换时重建
-    if (_cachedDao && _cachedSource === source) return _cachedDao;
+    // 数据源或底层绑定变化时重建
+    const binding = source === "d1" ? env.DB_CF
+        : source === "mysql" ? (env.DB_MYSQL_URL || env.DB_MYSQL_HOST)
+            : env.DATABASE_URL;
+    if (_cachedDao && _cachedSource === source && _cachedBinding === binding) return _cachedDao;
     _cachedSource = source;
+    _cachedBinding = binding;
     switch (source) {
         case "d1":
             if (!env.DB_CF) {

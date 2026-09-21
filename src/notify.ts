@@ -16,6 +16,18 @@
 
 import {readBool, readConf} from "./db/conf";
 
+/** Telegram 请求超时（毫秒）：避免推送阻塞签发流程 */
+const TG_TIMEOUT_MS = 8000;
+
+/**
+ * 后台任务上下文：只依赖 waitUntil。
+ * 用结构化类型而非 ExecutionContext，避免与全局 DOM 类型冲突，
+ * 同时便于测试时传入桩对象。
+ */
+export interface BackgroundContext {
+    waitUntil(promise: Promise<any>): void;
+}
+
 /** 通知事件类型（与 NOTIFY_* 开关一一对应） */
 export type NotifyEvent =
     | "success"   // 证书签发成功
@@ -123,6 +135,7 @@ export async function sendTelegram(
         // 逐个 Chat ID 发送；单个失败不影响其它
         for (const chatId of chatIds) {
             try {
+                // 超时兜底：Telegram 不可达时不能让调用方无限等待
                 const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
@@ -132,6 +145,7 @@ export async function sendTelegram(
                         text,
                         disable_web_page_preview: true,
                     }),
+                    signal: AbortSignal.timeout(TG_TIMEOUT_MS),
                 });
                 const data: any = await res.json().catch(() => ({}));
                 if (res.ok && data?.ok) {
@@ -159,9 +173,21 @@ export async function sendTelegram(
 
 /**
  * 统一通知入口：按事件开关决定是否推送 Telegram。
- * **调用方不需要 try/catch**——本函数保证不抛异常。
+ * 调用方不需要 try/catch——本函数保证不抛异常。
+ *
+ * 传入 ctx 时改为后台推送：HTTP 请求路径上的通知不再阻塞响应，
+ * 由 ExecutionContext 保证 Worker 在响应返回后继续执行完成。
+ * 定时任务（cron）没有响应可阻塞，同样可以安全使用。
  */
-export async function notify(env: any, payload: NotifyPayload): Promise<void> {
+export async function notify(env: any, payload: NotifyPayload, ctx?: BackgroundContext): Promise<void> {
+    if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(notifyNow(env, payload));
+        return;
+    }
+    await notifyNow(env, payload);
+}
+
+async function notifyNow(env: any, payload: NotifyPayload): Promise<void> {
     try {
         const switchKey = EVENT_SWITCH[payload.event];
         const enabled = await readBool(env, switchKey, true);

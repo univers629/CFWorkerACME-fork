@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { App, Button, Empty, Input, Segmented, Skeleton } from 'antd';
+import { App, Button, Empty, Input, Pagination, Segmented, Skeleton } from 'antd';
 import {
   ArrowRight,
   Archive,
@@ -30,7 +30,7 @@ import RevokeReasonSelect from '@components/molecules/RevokeReasonSelect';
 import Pill from '@components/atoms/Pill';
 import { useCopy } from '@hooks/useCopy';
 import { listOrders, operateOrder, RevokeReason } from '@api/order';
-import type { OrderRaw } from '@api/types';
+import type { OrderSummary } from '@api/types';
 import {
   FLAG_MAP,
   SIGN_SHORT_MAP,
@@ -92,56 +92,57 @@ export default function Certs() {
   const { message, modal } = App.useApp();
   const { copy } = useCopy();
   const [loading, setLoading] = useState(true);
-  const [orders, setOrders] = useState<OrderRaw[]>([]);
+  const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [view, setView] = useState<View>('card');
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<FilterType>('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [total, setTotal] = useState(0);
 
-  const load = async () => {
+  const load = async (opts?: {
+    page?: number;
+    pageSize?: number;
+    filter?: FilterType;
+    query?: string;
+  }) => {
+    const p = opts?.page ?? page;
+    const size = opts?.pageSize ?? pageSize;
+    const f = opts?.filter ?? filter;
+    const q = (opts?.query ?? query).trim();
     setLoading(true);
     try {
-      const data = await listOrders();
-      setOrders(data || []);
+      const res = await listOrders({
+        page: p,
+        page_size: size,
+        // 后端状态名与 UI 标签的映射：active → signed
+        status: f === 'all' ? undefined : f === 'active' ? 'signed' : f,
+        q: q || undefined,
+      });
+      setOrders(res.items || []);
+      setTotal(res.total);
     } catch {
       setOrders([]);
+      setTotal(0);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    load();
+    load({ page: 1 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const filtered = useMemo(() => {
-    return orders.filter((o) => {
-      const status = classifyFlag(o);
-      // 按状态过滤
-      if (filter === 'active' && status !== 'signed') return false;
-      if (
-        filter === 'pending' &&
-        status !== 'pending' &&
-        status !== 'verifying'
-      )
-        return false;
-      if (filter === 'expired' && status !== 'expired') return false;
-      if (filter === 'failed' && status !== 'failed') return false;
-
-      // 按搜索过滤
-      if (query.trim()) {
-        const q = query.toLowerCase();
-        const list = safeJsonParse<Array<{ name: string }>>(o.list) || [];
-        const domainStr = list.map((d) => d.name).join(',').toLowerCase();
-        if (
-          !domainStr.includes(q) &&
-          !o.uuid.toLowerCase().includes(q)
-        ) {
-          return false;
-        }
-      }
-      return true;
-    });
-  }, [orders, filter, query]);
+  /** 变更筛选或搜索后回到第一页重新查询 */
+  const applyFilter = (next: { filter?: FilterType; query?: string }) => {
+    const f = next.filter ?? filter;
+    const q = next.query ?? query;
+    if (next.filter !== undefined) setFilter(f);
+    if (next.query !== undefined) setQuery(q);
+    setPage(1);
+    load({ page: 1, filter: f, query: q });
+  };
 
   const handleDownload = async (uuid: string, type: 'cert' | 'key') => {
     try {
@@ -278,7 +279,7 @@ export default function Certs() {
       <SectionHeader
         icon={<FileStack size={18} />}
         title="证书列表"
-        subtitle={`共 ${orders.length} 个订单，当前显示 ${filtered.length} 个`}
+        subtitle={`共 ${total} 个订单`}
         extra={
           <Link to="/apply">
             <Button type="primary" icon={<Plus size={16} />}>
@@ -294,6 +295,7 @@ export default function Certs() {
           placeholder="搜索域名或订单号..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          onPressEnter={() => applyFilter({ query })}
           prefix={<Search size={14} className={styles.searchIcon} />}
           className={styles.search}
           allowClear
@@ -301,7 +303,7 @@ export default function Certs() {
 
         <Segmented
           value={filter}
-          onChange={(v) => setFilter(v as FilterType)}
+          onChange={(v) => applyFilter({ filter: v as FilterType })}
           options={FILTER_OPTIONS}
           className={styles.filter}
         />
@@ -328,19 +330,19 @@ export default function Certs() {
             />
           ))}
         </div>
-      ) : filtered.length === 0 ? (
+      ) : orders.length === 0 ? (
         <div className={styles.emptyWrap}>
           <EmptyState
             mood="empty"
-            title={orders.length === 0 ? '还没有证书呢...' : '没有匹配的结果'}
+            title={total === 0 ? '还没有证书呢...' : '没有匹配的结果'}
             description={
-              orders.length === 0
+              total === 0
                 ? '申请第一张证书，开启 HTTPS 之旅'
                 : '试试调整搜索条件或筛选项'
             }
             size="lg"
             action={
-              orders.length === 0 ? (
+              total === 0 ? (
                 <Link to="/apply">
                   <Button type="primary" size="large" icon={<Plus size={16} />}>
                     申请证书
@@ -360,7 +362,7 @@ export default function Certs() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
             >
-              {filtered.map((o, i) => (
+              {orders.map((o, i) => (
                 <OrderCard
                   key={o.uuid}
                   order={o}
@@ -384,7 +386,7 @@ export default function Certs() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
             >
-              {filtered.map((o, i) => (
+              {orders.map((o, i) => (
                 <OrderRow
                   key={o.uuid}
                   order={o}
@@ -402,6 +404,25 @@ export default function Certs() {
           )}
         </AnimatePresence>
       )}
+
+      {/* 分页：服务端分页，仅在超过一页时显示 */}
+      {!loading && total > pageSize && (
+        <div className={styles.pager}>
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showSizeChanger
+            pageSizeOptions={[10, 20, 50]}
+            size="small"
+            onChange={(p, size) => {
+              setPage(p);
+              setPageSize(size);
+              load({ page: p, pageSize: size });
+            }}
+          />
+        </div>
+      )}
     </PageShell>
   );
 }
@@ -411,7 +432,7 @@ export default function Certs() {
  * ============================================================ */
 
 interface OrderCardProps {
-  order: OrderRaw;
+  order: OrderSummary;
   index: number;
   onCopyId: () => void;
   onDownloadCert: () => void;
@@ -424,7 +445,7 @@ interface OrderCardProps {
 }
 
 /** 证书状态尾巴文案：已签发显示剩余天数；已过期显示过期时长 */
-function renderExpiryBadge(order: OrderRaw, status: OrderStatus) {
+function renderExpiryBadge(order: OrderSummary, status: OrderStatus) {
   if (status === 'signed') {
     const days = remainDays(order.next);
     const isExpiring = days <= 14;
@@ -470,8 +491,8 @@ function OrderCard({
   const colorVariant = STATUS_COLOR[status] as any;
   const isSigned = status === 'signed';
   const isExpired = status === 'expired';
-  const canRevoke = (isSigned || isExpired) && !!order.keys;
-  const hasKey = !!order.keys;
+  const hasKey = !!order.has_keys;
+  const canRevoke = (isSigned || isExpired) && hasKey;
 
   return (
     <motion.div
@@ -628,7 +649,7 @@ function OrderRow({
   onRemoveKey,
   onRevoke,
 }: {
-  order: OrderRaw;
+  order: OrderSummary;
   index: number;
   onCopyId: () => void;
   onDownloadCert: () => void;
@@ -644,7 +665,7 @@ function OrderRow({
   const colorVariant = STATUS_COLOR[status] as any;
   const isSigned = status === 'signed';
   const isExpired = status === 'expired';
-  const hasKey = !!order.keys;
+  const hasKey = !!order.has_keys;
   const canRevoke = (isSigned || isExpired) && hasKey;
 
   return (

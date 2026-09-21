@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
-import type { OrderRaw } from '@api/types';
+import type { OrderSummary } from '@api/types';
 import { fmtRelative, shortenId, summarizeDomains } from '@utils/format';
 import { FLAG_MAP, FLAG_PULSE } from '@utils/constants';
 import { safeJsonParse } from '@utils/format';
@@ -10,7 +10,7 @@ import CodeInline from '@components/atoms/CodeInline';
 import styles from './Panel.module.css';
 
 export interface MessageListProps {
-  orders: OrderRaw[];
+  orders: OrderSummary[];
 }
 
 export default function MessageList({ orders }: MessageListProps) {

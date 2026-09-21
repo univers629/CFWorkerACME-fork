@@ -57,7 +57,30 @@ export interface ConfRow {
     time: number | null;
 }
 
-/** 列表查询通用过滤条件（AND 语义） */
+/** Apply 摘要行：列表展示所需字段，不含 cert / keys / data 等大字段与私钥原文 */
+export interface ApplySummaryRow {
+    uuid: string;
+    mail: string;
+    sign: number | null;
+    type: number | null;
+    auto: number;
+    flag: number;
+    time: number;
+    next: number;
+    main: string;
+    list: string;
+    text?: string | null;
+    /** 是否已签发证书（1/0），替代返回 cert 原文 */
+    has_cert: number;
+    /** 是否存在私钥（1/0），替代返回 keys 原文 */
+    has_keys: number;
+}
+
+/**
+ * 列表查询通用过滤条件。
+ * 同一层内的各类条件之间为 AND；and / or 可嵌套子过滤器表达复合判断，
+ * 用于描述无法由单列条件表达的派生状态（例如「已过期」= flag=5 且 next<=now）。
+ */
 export interface QueryFilter {
     /** 精确等值 */
     eq?: Record<string, string | number | null>;
@@ -70,6 +93,10 @@ export interface QueryFilter {
     lte?: Record<string, number>;
     /** IN (...) */
     in?: Record<string, (string | number)[]>;
+    /** 子过滤器全部满足 */
+    and?: QueryFilter[];
+    /** 子过滤器任一满足 */
+    or?: QueryFilter[];
 }
 
 /** 分页入参 */
@@ -102,7 +129,20 @@ export interface Dao {
 
     /* --------------------- Apply --------------------- */
     getApply(uuid: string): Promise<ApplyRow | null>;
-    listApplies(filter?: QueryFilter, page?: Pagination): Promise<{ rows: ApplyRow[]; total: number }>;
+    /**
+     * 按条件遍历全部匹配行（不分页、不统计总数），用于定时任务批量扫描。
+     * 与 listApplySummaries 的区别：返回完整行（含 cert / keys），不做 COUNT、
+     * 不受 200 行分页上限约束，仅供内部批量处理使用。
+     */
+    scanApplies(filter?: QueryFilter): Promise<ApplyRow[]>;
+    /** 统计匹配行数（只取 COUNT，不取回行内容） */
+    countApplies(filter?: QueryFilter): Promise<number>;
+    /**
+     * 列表查询：只返回摘要字段，不返回 cert / keys / data。
+     * 列表页只需要「是否已签发 / 是否有私钥」的布尔判断，返回原文既无必要
+     * 也放大了传输量与泄露面。
+     */
+    listApplySummaries(filter?: QueryFilter, page?: Pagination): Promise<{ rows: ApplySummaryRow[]; total: number }>;
     insertApply(row: ApplyRow): Promise<void>;
     updateApply(uuid: string, patch: Partial<ApplyRow>): Promise<void>;
     deleteApply(uuid: string): Promise<void>;

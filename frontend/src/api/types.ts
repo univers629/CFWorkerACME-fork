@@ -45,8 +45,11 @@ export interface ApplyPayload {
   subject: CertSubject;
 }
 
-/** 订单数据（后端存储结构） */
-export interface OrderRaw {
+/**
+ * 订单摘要（列表接口返回结构）
+ * 不含 cert / keys / data 原文，仅给出是否存在的标记。
+ */
+export interface OrderSummary {
   uuid: string;
   mail: string;
   sign: string;
@@ -57,16 +60,37 @@ export interface OrderRaw {
   next: number;
   main: string; // JSON 字符串
   list: string; // JSON 字符串（DomainItem[]）
-  keys: string;
-  cert: string;
   text: string;
-  data?: string;
+  has_cert: boolean | number;
+  has_keys: boolean | number;
 }
 
-/** 订单（解析后） */
-export interface Order extends Omit<OrderRaw, 'main' | 'list' | 'data'> {
+/** 订单列表查询参数 */
+export interface OrderListQuery {
+  page?: number;
+  page_size?: number;
+  /** 派生状态过滤：all / signed / expired / pending / failed */
+  status?: string;
+  /** 域名关键字 */
+  q?: string;
+}
+
+/** 订单状态统计（首页概览用，覆盖全部订单而非当前页） */
+export interface OrderStats {
+  total: number;
+  pending: number;
+  verifying: number;
+  signed: number;
+  expired: number;
+  failed: number;
+}
+
+/** 订单详情（解析后）；cert / keys 仅详情接口返回 */
+export interface Order extends Omit<OrderSummary, 'main' | 'list'> {
   main: CertSubject;
   list: DomainItem[];
+  cert?: string;
+  keys?: string;
   data?: any;
 }
 

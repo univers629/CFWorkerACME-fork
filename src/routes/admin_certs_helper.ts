@@ -18,7 +18,7 @@ const ACME_URL: Record<string, any> = {
     "sslcom-trust": "https://acme.ssl.com/sslcom-dv-",
 };
 
-/** 与 certs.ts 中 getStart() 等价，但独立不依赖 saves 层 */
+/** 与 certs.ts 中 getStart() 等价，独立于证书状态机模块 */
 export async function getAcmeClient(
     env: Bindings,
     user: UserRow,

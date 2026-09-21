@@ -1,5 +1,5 @@
 import {Context} from "hono";
-import * as saves from './saves'
+import {ensureDao} from './db'
 import * as local from "hono/cookie";
 import {Resend} from "resend";
 import CryptoJS from "crypto-js";// @ts-ignore
@@ -73,9 +73,7 @@ export async function getNonce(c: Context, lens: number = 8) {
         return c.json(await addUsers(c, email)) // 新增真用户
     }
     if (Object.keys(user_db).length > 0) {
-        await saves.updateDB(c.env.DB_CF, "Users",
-            {code: nonce,},
-            {mail: email,});
+        await (await ensureDao(c.env as any)).updateUser(email, {code: nonce});
     }
     return c.json({"nonce": nonce}, 200);
 }
@@ -158,33 +156,29 @@ export async function newNonce(lens: number = 8): Promise<string> {
 
 // 获取用户 ###############################################################################
 export async function getUsers(c: Context, email: string) {
-    // console.log(email);
-    return await saves.selectDB(c.env.DB_CF, "Users", {mail: {value: email}});
+    const row = await (await ensureDao(c.env as any)).getUser(email);
+    return row ? [row] : [];
 }
 
 // 删除用户 ###############################################################################
 export async function delUsers(c: Context, email: string) {
-    // saves.deleteDB 的 where 参数约定为普通 kv 对象（{col: value}），
-    // 不是旧的 SelectWhere 形式（{col: {value, op}}）；传后者会导致
-    // D1 bind 收到 object 抛出 D1_TYPE_ERROR。
-    return await saves.deleteDB(c.env.DB_CF, "Users", {mail: email});
+    return await (await ensureDao(c.env as any)).deleteUser(email);
 }
 
 // 新增用户 ###############################################################################
 export async function addUsers(c: Context, email: string, reset: boolean = false) {
     const nonce = await newNonce(8);
+    const dao = await ensureDao(c.env as any);
     if (!reset) {
-        await saves.insertDB(c.env.DB_CF, "Users", {
+        await dao.insertUser({
             mail: email,
             code: nonce,
             time: Date.now(),
         });
     } else {
-        await saves.updateDB(c.env.DB_CF, "Users", {
+        await dao.updateUser(email, {
             code: nonce,
             time: Date.now(),
-        }, {
-            mail: email,
         });
     }
     return await codeSend(c, email, nonce)
@@ -209,7 +203,7 @@ export async function userRegs(c: Context) {
         let user_data_in = user_data_db[0]
         console.log(user_data_in['pass'], pass_code_in, pass_sets_in);
         if (user_data_in['pass'] !== pass_code_in) return c.json({flags: 5}, 403);
-        await saves.updateDB(c.env.DB_CF, "Users", {pass: pass_sets_in}, {mail: mail_data_in})
+        await (await ensureDao(c.env as any)).updateUser(mail_data_in, {pass: pass_sets_in})
         return c.redirect("/#/login", 302);
     }
     // 校验验证码 ========================================================================
@@ -319,10 +313,7 @@ export async function userRegs(c: Context) {
                     updates["is_admin"] = 0;
                 }
             }
-            await saves.updateDB(c.env.DB_CF, "Users",
-                updates,
-                {mail: mail_data_in,}
-            );
+            await (await ensureDao(c.env as any)).updateUser(mail_data_in, updates);
 
             return c.redirect("/#/login", 302);
             // return c.json({error: 'OK'}, 200);
@@ -348,10 +339,7 @@ export async function userPost(c: Context) {
     local.deleteCookie(c, 'users')
     local.setCookie(c, 'mail', mail_data_in);
     await local.setSignedCookie(c, 'auth', pass_hmac_in, user_data_in['pass']);
-    await saves.updateDB(c.env.DB_CF, "Users",
-        {code: "",},
-        {mail: mail_data_in,}
-    );
+    await (await ensureDao(c.env as any)).updateUser(mail_data_in, {code: ""});
     return c.json({flags: 1});
 }
 

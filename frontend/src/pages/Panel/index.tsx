@@ -17,89 +17,66 @@ import Pill from '@components/atoms/Pill';
 import StatusPulse from '@components/molecules/StatusPulse';
 import Kaomoji from '@components/molecules/Kaomoji';
 import { useAuthStore } from '@stores/useAuthStore';
-import { listOrders } from '@api/order';
-import type { OrderRaw } from '@api/types';
+import { fetchOrderStats, listOrders } from '@api/order';
+import type { OrderStats, OrderSummary } from '@api/types';
 import { classifyFlag } from '@utils/order';
 import MessageList from './MessageList';
 import styles from './Panel.module.css';
 
-interface StatsResult {
-  pending: number; // 待验证
-  verifying: number; // 验证中
-  signed: number; // 已签发
-  expired: number; // 已过期
-  failed: number; // 已失效
-  trend: Record<string, number[]>;
-}
+const EMPTY_STATS: OrderStats = {
+  total: 0,
+  pending: 0,
+  verifying: 0,
+  signed: 0,
+  expired: 0,
+  failed: 0,
+};
 
-function computeStats(orders: OrderRaw[]): StatsResult {
-  let pending = 0;
-  let verifying = 0;
-  let signed = 0;
-  let expired = 0;
-  let failed = 0;
-
-  for (const o of orders) {
-    switch (classifyFlag(o)) {
-      case 'pending':
-        pending += 1;
-        break;
-      case 'verifying':
-        verifying += 1;
-        break;
-      case 'signed':
-        signed += 1;
-        break;
-      case 'expired':
-        expired += 1;
-        break;
-      case 'failed':
-        failed += 1;
-        break;
-    }
-  }
-
-  // 生成简单的 sparkline（最近 7 天每天的订单数）
+/**
+ * 生成简单的 sparkline（最近 7 天每天的订单数）。
+ * 基于当前页订单，仅作趋势示意。
+ */
+function makeTrend(orders: OrderSummary[], filter: (o: OrderSummary) => boolean): number[] {
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
-  const makeTrend = (filter: (o: OrderRaw) => boolean) => {
-    const buckets = new Array(7).fill(0);
-    for (const o of orders) {
-      if (!filter(o)) continue;
-      const diff = Math.floor((now - (o.time || 0)) / dayMs);
-      if (diff >= 0 && diff < 7) buckets[6 - diff] += 1;
-    }
-    return buckets;
-  };
-
-  return {
-    pending,
-    verifying,
-    signed,
-    expired,
-    failed,
-    trend: {
-      pending: makeTrend((o) => classifyFlag(o) === 'pending'),
-      verifying: makeTrend((o) => classifyFlag(o) === 'verifying'),
-      signed: makeTrend((o) => classifyFlag(o) === 'signed'),
-      expired: makeTrend((o) => classifyFlag(o) === 'expired'),
-      failed: makeTrend((o) => classifyFlag(o) === 'failed'),
-    },
-  };
+  const buckets = new Array(7).fill(0);
+  for (const o of orders) {
+    if (!filter(o)) continue;
+    const diff = Math.floor((now - (o.time || 0)) / dayMs);
+    if (diff >= 0 && diff < 7) buckets[6 - diff] += 1;
+  }
+  return buckets;
 }
 
 export default function Panel() {
   const email = useAuthStore((s) => s.email);
   const [loading, setLoading] = useState(true);
-  const [orders, setOrders] = useState<OrderRaw[]>([]);
+  const [stats, setStats] = useState<OrderStats>(EMPTY_STATS);
+  const [orders, setOrders] = useState<OrderSummary[]>([]);
+  const [trend, setTrend] = useState<Record<string, number[]>>({});
 
   const load = async () => {
     setLoading(true);
     try {
-      const list = await listOrders();
-      setOrders(list || []);
+      // 统计需要覆盖全部订单，列表只取最近 8 条用于消息区
+      const [s, list] = await Promise.all([
+        fetchOrderStats(),
+        listOrders({ page: 1, page_size: 8 }),
+      ]);
+      setStats(s);
+      const items = list.items || [];
+      setOrders(items);
+      setTrend({
+        pending: makeTrend(items, (o) => classifyFlag(o) === 'pending'),
+        verifying: makeTrend(items, (o) => classifyFlag(o) === 'verifying'),
+        signed: makeTrend(items, (o) => classifyFlag(o) === 'signed'),
+        expired: makeTrend(items, (o) => classifyFlag(o) === 'expired'),
+        failed: makeTrend(items, (o) => classifyFlag(o) === 'failed'),
+      });
     } catch {
+      setStats(EMPTY_STATS);
       setOrders([]);
+      setTrend({});
     } finally {
       setLoading(false);
     }
@@ -109,12 +86,8 @@ export default function Panel() {
     load();
   }, []);
 
-  const stats = useMemo(() => computeStats(orders), [orders]);
-
   const recentOrders = useMemo(() => {
-    return [...orders]
-      .sort((a, b) => (b.time || 0) - (a.time || 0))
-      .slice(0, 8);
+    return [...orders].sort((a, b) => (b.time || 0) - (a.time || 0)).slice(0, 8);
   }, [orders]);
 
   return (
@@ -144,7 +117,7 @@ export default function Panel() {
           <SectionHeader
             icon={<Activity size={18} />}
             title="证书总览"
-            subtitle={`共 ${orders.length} 个订单`}
+            subtitle={`共 ${stats.total} 个订单`}
             extra={
               <Pill
                 variant="neutral"
@@ -175,7 +148,7 @@ export default function Panel() {
                 icon={<FileStack size={16} />}
                 status="pending"
                 accent="lavender"
-                trend={stats.trend.pending}
+                trend={trend.pending}
               />
               <StatCard
                 title="验证中"
@@ -183,7 +156,7 @@ export default function Panel() {
                 icon={<Activity size={16} />}
                 status="verifying"
                 accent="lemon"
-                trend={stats.trend.verifying}
+                trend={trend.verifying}
               />
               <StatCard
                 title="已签发"
@@ -191,7 +164,7 @@ export default function Panel() {
                 icon={<FileStack size={16} />}
                 status="success"
                 accent="brand"
-                trend={stats.trend.signed}
+                trend={trend.signed}
               />
               <StatCard
                 title="已过期"
@@ -199,7 +172,7 @@ export default function Panel() {
                 icon={<FileStack size={16} />}
                 status="expired"
                 accent="accent"
-                trend={stats.trend.expired}
+                trend={trend.expired}
               />
               <StatCard
                 title="已失效"
@@ -207,7 +180,7 @@ export default function Panel() {
                 icon={<FileStack size={16} />}
                 status="failed"
                 accent="accent"
-                trend={stats.trend.failed}
+                trend={trend.failed}
               />
             </div>
           )}

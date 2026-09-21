@@ -33,7 +33,7 @@ export default {
             // 1) 自动续期扫描：把「即将到期且勾选了自动续期」的订单重置为 flag=0。
             //    必须排在 Processing 之前，这样同一次 tick 就能继续把它推进下去。
             const {scanAutoRenew} = await import('./renew');
-            const renewed = await scanAutoRenew({...env, DB_CF: env.DB_CF});
+            const renewed = await scanAutoRenew({...env, DB_CF: env.DB_CF}, ctx);
             if (renewed.triggered > 0) {
                 console.log(`[cron] 自动续期触发 ${renewed.triggered} 个订单: ${renewed.uuids.join(', ')}`);
             }
@@ -42,12 +42,12 @@ export default {
             }
 
             const certs = await import('./certs');
-            const result = await certs.Processing({...env, DB_CF: env.DB_CF});
+            const result = await certs.Processing({...env, DB_CF: env.DB_CF}, ctx);
             console.log(`[cron] processed=${result.length} cost=${Date.now() - started}ms at ${controller.scheduledTime}`);
 
             // 到期提醒扫描（NOTIFY_ON_EXPIRE7 / NOTIFY_ON_EXPIRED 的实际消费点）
             const {scanExpiry} = await import('./expiry');
-            const scanned = await scanExpiry({...env, DB_CF: env.DB_CF});
+            const scanned = await scanExpiry({...env, DB_CF: env.DB_CF}, ctx);
             if (scanned.expire7 || scanned.expired) {
                 console.log(`[cron] 到期提醒 expire7=${scanned.expire7} expired=${scanned.expired}`);
             }

@@ -5,11 +5,15 @@
  */
 
 import type {
-    Dao, UserRow, ApplyRow, ConfRow, QueryFilter, Pagination
+    Dao, UserRow, ApplyRow, ApplySummaryRow, ConfRow, QueryFilter, Pagination
 } from "./dao";
 
-/** 将过滤条件翻译为 WHERE 片段 + 参数数组 */
-function buildWhere(filter?: QueryFilter): { sql: string; params: any[] } {
+/**
+ * 将单个过滤节点翻译为 SQL 片段（不含 WHERE 关键字）+ 参数数组。
+ * 节点内各条件之间为 AND；and / or 子节点分别以 AND / OR 连接。
+ * 返回空字符串表示该节点无有效条件。
+ */
+function buildNode(filter: QueryFilter | undefined): { sql: string; params: any[] } {
     if (!filter) return {sql: "", params: []};
     const parts: string[] = [];
     const params: any[] = [];
@@ -30,8 +34,29 @@ function buildWhere(filter?: QueryFilter): { sql: string; params: any[] } {
         parts.push(`${k} IN (${v.map(() => "?").join(",")})`);
         params.push(...v);
     }
-    if (parts.length === 0) return {sql: "", params: []};
-    return {sql: " WHERE " + parts.join(" AND "), params};
+    for (const sub of filter.and ?? []) {
+        const inner = buildNode(sub);
+        if (!inner.sql) continue;
+        parts.push(`(${inner.sql})`);
+        params.push(...inner.params);
+    }
+    const orParts: string[] = [];
+    for (const sub of filter.or ?? []) {
+        const inner = buildNode(sub);
+        if (!inner.sql) continue;
+        orParts.push(`(${inner.sql})`);
+        params.push(...inner.params);
+    }
+    // OR 组整体作为一项并入 AND，避免与同级其它条件混淆优先级
+    if (orParts.length === 1) parts.push(orParts[0]);
+    else if (orParts.length > 1) parts.push("(" + orParts.join(" OR ") + ")");
+    return {sql: parts.join(" AND "), params};
+}
+
+/** 将过滤条件翻译为 WHERE 片段 + 参数数组 */
+function buildWhere(filter?: QueryFilter): { sql: string; params: any[] } {
+    const {sql, params} = buildNode(filter);
+    return sql ? {sql: " WHERE " + sql, params} : {sql: "", params: []};
 }
 
 /** 翻页 + 排序 */
@@ -126,14 +151,32 @@ export class D1Dao implements Dao {
         return row ?? null;
     }
 
-    async listApplies(filter?: QueryFilter, page?: Pagination) {
+    async scanApplies(filter?: QueryFilter): Promise<ApplyRow[]> {
+        const {sql: where, params} = buildWhere(filter);
+        const {results} = await this.db.prepare(`SELECT * FROM Apply${where}`)
+            .bind(...params).all();
+        return results as unknown as ApplyRow[];
+    }
+
+    async countApplies(filter?: QueryFilter): Promise<number> {
+        const {sql: where, params} = buildWhere(filter);
+        const row = await this.db.prepare(`SELECT COUNT(*) AS c FROM Apply${where}`)
+            .bind(...params).first<{ c: number }>();
+        return Number(row?.c ?? 0);
+    }
+
+    async listApplySummaries(filter?: QueryFilter, page?: Pagination) {
         const {sql: where, params} = buildWhere(filter);
         const countRow = await this.db.prepare(`SELECT COUNT(*) AS c FROM Apply${where}`)
             .bind(...params).first<{ c: number }>();
         const total = Number(countRow?.c ?? 0);
-        const {results} = await this.db.prepare(`SELECT * FROM Apply${where}${buildPage(page)}`)
-            .bind(...params).all();
-        return {rows: results as unknown as ApplyRow[], total};
+        const {results} = await this.db.prepare(
+            `SELECT uuid, mail, sign, type, auto, flag, time, next, main, list, text, ` +
+            `(cert IS NOT NULL AND cert != '') AS has_cert, ` +
+            `(keys IS NOT NULL AND keys != '') AS has_keys ` +
+            `FROM Apply${where}${buildPage(page)}`
+        ).bind(...params).all();
+        return {rows: results as unknown as ApplySummaryRow[], total};
     }
 
     async insertApply(row: ApplyRow): Promise<void> {

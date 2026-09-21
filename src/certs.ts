@@ -1,17 +1,17 @@
 import * as acme from 'acme-client';
 import {Client} from "acme-client";
-import * as saves from './saves'
 import * as index from './index'
 import * as agent from "./agent";
 import * as query from "./query";
-import {Bindings, D1Bindings} from './index'
+import {Bindings} from './index'
 import {hmacSHA2} from "./users";
-import {notify} from "./notify";
+import {notify, type BackgroundContext} from "./notify";
 // 注意：这里曾经有一行 `import {errors} from "wrangler";`（实际从未使用）。
 // 它会让 esbuild 在打包 Worker 时去解析 wrangler 这个 10MB+ 的开发期 CLI 包，
 // 一旦安装时跳过了 devDependencies（npm ci --omit=dev），打包就会直接失败。
 // 已删除，不要加回来。
 import {readConf} from "./db/conf";
+import {ensureDao} from "./db";
 import {parseCertValidity} from "./utils/certinfo";
 
 
@@ -121,14 +121,16 @@ export function autoVerifiableDomains(order_info: any): string[] {
 }
 
 // 整体处理进程 ====================================================================================
-export async function Processing(env: D1Bindings) {
-    let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
+export async function Processing(env: Bindings, ctx?: BackgroundContext) {
+    const dao = await ensureDao(env as any);
+    // flag <= 4 等价于「未签发或已失效」，且能命中 idx_apply_flag；
+    // 原先的 flag != 5 无法使用索引，每次 cron 都是全表扫描。
+    let order_list: any = await dao.scanApplies({lte: {flag: 4}});
     let result: any[] = []
     for (const id in order_list) { // 获取信息 ==================================================================
         let order_info = order_list[id]; // 获取当前订单详细情况
         let order_mail = order_info['mail']; // 当前订单用户邮箱
-        let order_user: any = (await saves.selectDB( // 查询申请者信息
-            env.DB_CF, "Users", {mail: {value: order_mail}}))[0]; // 按不同阶段分配程序处理 ========================
+        let order_user: any = await dao.getUser(order_mail); // 按不同阶段分配程序处理 ========================
         if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
         if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
         if (order_info['flag'] == 2) {
@@ -138,7 +140,7 @@ export async function Processing(env: D1Bindings) {
             result.push(await opDomain(env, order_user, order_info, autos));
         }// 自动验证域名
         if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
-        if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info));// 自动执行获取证书
+        if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info, ctx));// 自动执行获取证书
     } // ========================================================================================================
     return result;
 }
@@ -149,12 +151,12 @@ export async function Processing(env: D1Bindings) {
 // - flag=5  证书签发完成
 // - flag=-1 失败
 // - 或中间某步 flag 未发生变化（避免死循环）
-export async function processOne(env: D1Bindings, order_uuid: string) {
+export async function processOne(env: Bindings, order_uuid: string, ctx?: BackgroundContext) {
     let result: any[] = [];
+    const dao = await ensureDao(env as any);
     // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
     {
-        let cur: any = (await saves.selectDB(
-            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        let cur: any = await dao.getApply(order_uuid);
         if (cur && cur['data'] && cur['list']) {
             let cur_flag = Number(cur['flag']);
             if (cur_flag >= 1 && cur_flag < 4) { // 只对尚未开始验证的中间态做自愈
@@ -165,7 +167,7 @@ export async function processOne(env: D1Bindings, order_uuid: string) {
                         return !auth_val;
                     });
                     if (need_repair && cur_flag !== 1) {
-                        await saves.updateDB(env.DB_CF, "Apply", {flag: 1}, {uuid: order_uuid});
+                        await dao.updateApply(order_uuid, {flag: 1});
                         console.log("processOne self-heal: reset flag=1 for order " + order_uuid);
                     }
                 } catch (e) {
@@ -175,27 +177,23 @@ export async function processOne(env: D1Bindings, order_uuid: string) {
         }
     }
     for (let i = 0; i < 8; i++) { // 最多推进 8 步，防止极端情况死循环
-        let order_info: any = (await saves.selectDB(
-            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        let order_info: any = await dao.getApply(order_uuid);
         if (!order_info) break;
         let flag = Number(order_info['flag']);
         if (flag === 2 || flag === 5 || flag < 0) break; // 终止条件
-        let order_user: any = (await saves.selectDB(
-            env.DB_CF, "Users", {mail: {value: order_info['mail']}}))[0];
+        let order_user: any = await dao.getUser(order_info['mail']);
         try {
             if (flag === 0) result.push(await newApply(env, order_user, order_info));
             else if (flag === 1) result.push(await setApply(env, order_user, order_info));
             else if (flag === 3) result.push(await dnsAuthy(env, order_user, order_info));
-            else if (flag === 4) result.push(await getCerts(env, order_user, order_info));
+            else if (flag === 4) result.push(await getCerts(env, order_user, order_info, ctx));
             else break; // 其它未知状态，停止推进
         } catch (e) {
             const msg = extractAcmeError(e);
             console.error("processOne error at flag=" + flag + ":", e);
             // 将错误信息持久化到订单，供前端展示
             try {
-                await saves.updateDB(env.DB_CF, "Apply",
-                    {flag: -1, text: "处理失败: " + msg},
-                    {uuid: order_uuid});
+                await dao.updateApply(order_uuid, {flag: -1, text: "处理失败: " + msg});
             } catch (ue) {
                 console.error("processOne persist error failed:", ue);
             }
@@ -203,15 +201,15 @@ export async function processOne(env: D1Bindings, order_uuid: string) {
             break;
         }
         // 若本轮处理后 flag 未推进，防止死循环
-        let next_info: any = (await saves.selectDB(
-            env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+        let next_info: any = await dao.getApply(order_uuid);
         if (!next_info || Number(next_info['flag']) === flag) break;
     }
     return result;
 }
 
 // 新增证书订单 =====================================================================================
-export async function newApply(env: D1Bindings, order_user: any, order_info: any) {
+export async function newApply(env: Bindings, order_user: any, order_info: any) {
+    const dao = await ensureDao(env as any);
     // 获取申请域名信息 =============================================================================
     let client_data: any = await getStart(env, order_user, order_info); // 获取域名证书的申请操作接口
     if (client_data == null) return {"texts": "处理失败，详见日志输出"};
@@ -221,18 +219,17 @@ export async function newApply(env: D1Bindings, order_user: any, order_info: any
         let orders_data: any = JSON.stringify(await client_data.createOrder({identifiers: domain_list}));
         // 写入订单详细数据 =============================================================================
         const timestamp = new Date(new Date().setDate(new Date().getDate() + 7)).getTime();
-        await saves.updateDB(env.DB_CF, "Apply", {flag: 1}, {uuid: order_info['uuid']}) // 更改状态码
-        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {text: "订单创建成功"}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {data: orders_data}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {flag: 1}) // 更改状态码
+        await dao.updateApply(order_info['uuid'], {next: timestamp})
+        await dao.updateApply(order_info['uuid'], {text: "订单创建成功"})
+        await dao.updateApply(order_info['uuid'], {data: orders_data})
     } catch (e) {
         const msg = extractAcmeError(e);
         console.error("newApply createOrder failed:", e);
         // 记录到订单：标记失败 + 写入明确错误原因，便于前端显示
         try {
-            await saves.updateDB(env.DB_CF, "Apply",
-                {flag: -1, text: "订单创建失败: " + msg},
-                {uuid: order_info['uuid']});
+            await dao.updateApply(order_info['uuid'],
+                {flag: -1, text: "订单创建失败: " + msg});
         } catch (ue) {
             console.error("newApply persist error failed:", ue);
         }
@@ -246,7 +243,8 @@ export async function newApply(env: D1Bindings, order_user: any, order_info: any
 }
 
 // 自动验证代理 =====================================================================================
-export async function setApply(env: D1Bindings, order_user: any, order_info: any) {
+export async function setApply(env: Bindings, order_user: any, order_info: any) {
+    const dao = await ensureDao(env as any);
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
@@ -304,15 +302,16 @@ export async function setApply(env: D1Bindings, order_user: any, order_info: any
         domain_save.push(domain_item);
     }
     if (domain_text.length == 0) domain_text = "域名处理成功"
-    await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
-    await saves.updateDB(env.DB_CF, "Apply", {flag: domain_flag}, {uuid: order_info['uuid']})
-    await saves.updateDB(env.DB_CF, "Apply", {text: domain_text}, {uuid: order_info['uuid']})
+    await dao.updateApply(order_info['uuid'], {list: JSON.stringify(domain_save)})
+    await dao.updateApply(order_info['uuid'], {flag: domain_flag})
+    await dao.updateApply(order_info['uuid'], {text: domain_text})
     // console.log(domain_save);
     return {"texts": domain_text};
 }
 
 // 修改验证状态 =====================================================================================
-export async function opDomain(env: D1Bindings, order_user: any, order_info: any, sets_list: string[]) {
+export async function opDomain(env: Bindings, order_user: any, order_info: any, sets_list: string[]) {
+    const dao = await ensureDao(env as any);
     let domain_list: any = order_info['list'];
     // 执行操作部分 =================================================================================
     let domain_save: any[] = []
@@ -335,15 +334,16 @@ export async function opDomain(env: D1Bindings, order_user: any, order_info: any
         domain_save.push(domain_item);
     }
     if (sets_list.length !== 0) {
-        await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {text: "订单域名验证状态修改成功"}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {flag: domain_flag}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {list: JSON.stringify(domain_save)})
+        await dao.updateApply(order_info['uuid'], {text: "订单域名验证状态修改成功"})
+        await dao.updateApply(order_info['uuid'], {flag: domain_flag})
     }
     return {"texts": "处理成功"};
 }
 
 // 执行域名验证 ====================================================================================
-export async function dnsAuthy(env: D1Bindings, order_user: any, order_info: any) {
+export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) {
+    const dao = await ensureDao(env as any);
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
@@ -397,26 +397,27 @@ export async function dnsAuthy(env: D1Bindings, order_user: any, order_info: any
     }
     orders_data = await client_data.getOrder(orders_text);
     // console.log(orders_data);
-    await saves.updateDB(env.DB_CF, "Apply", {data: JSON.stringify(orders_data)}, {uuid: order_info['uuid']})
-    await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
-    await saves.updateDB(env.DB_CF, "Apply", {flag: status_flag}, {uuid: order_info['uuid']})
-    if (status_flag == -1) await saves.updateDB(env.DB_CF, "Apply", {
+    await dao.updateApply(order_info['uuid'], {data: JSON.stringify(orders_data)})
+    await dao.updateApply(order_info['uuid'], {list: JSON.stringify(domain_save)})
+    await dao.updateApply(order_info['uuid'], {flag: status_flag})
+    if (status_flag == -1) await dao.updateApply(order_info['uuid'], {
         text: "域名验证失败:" + JSON.stringify(domain_fail)
-    }, {uuid: order_info['uuid']})
-    else await saves.updateDB(env.DB_CF, "Apply", {text: "域名验证通过"}, {uuid: order_info['uuid']})
+    })
+    else await dao.updateApply(order_info['uuid'], {text: "域名验证通过"})
     return {"texts": "处理成功"};
 }
 
 // 完成证书申请 #######################################################################################################
-export async function getCerts(env: D1Bindings, order_user: any, order_info: any) {
+export async function getCerts(env: Bindings, order_user: any, order_info: any, ctx?: BackgroundContext) {
+    const dao = await ensureDao(env as any);
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
     let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
     // console.log(orders_data);
     console.log('Orders Remote Verify Status:', orders_data.status);
     if (orders_data.status == "invalid") {
-        await saves.updateDB(env.DB_CF, "Apply", {flag: -1}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发失败"}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {flag: -1})
+        await dao.updateApply(order_info['uuid'], {text: "证书签发失败"})
         // 通知（失败不抛异常，不影响主流程）
         await notify(env, {
             event: "fail",
@@ -425,7 +426,7 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
             uuid: order_info['uuid'],
             detail: "ACME 侧返回 invalid，请检查域名解析或验证配置",
             siteHost: await siteHostOf(env),
-        });
+        }, ctx);
         return {"texts": "验证状态无效"};
     }
     if (orders_data.status === 'ready') {
@@ -442,20 +443,20 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
         // 直接覆盖会让库中出现「新私钥 + 旧证书」的组合。
         // 列不存在（迁移未执行）时退回旧行为，避免阻断签发。
         try {
-            await saves.updateDB(env.DB_CF, "Apply", {pending_keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+            await dao.updateApply(order_info['uuid'], {pending_keys: privateKeyBuff.toString()})
         } catch (e) {
             console.warn(
                 `[certs] pending_keys 写入失败，回退为直接写 keys（uuid=${order_info['uuid']}）`, e
             );
-            await saves.updateDB(env.DB_CF, "Apply", {keys: privateKeyBuff.toString()}, {uuid: order_info['uuid']})
+            await dao.updateApply(order_info['uuid'], {keys: privateKeyBuff.toString()})
         }
         const finish_text: any = await client_data.finalizeOrder(orders_data, certificateCSR);// 最终确认订单
         console.log('Orders Remote Finish Status:', finish_text);
-        await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发请求提交成功"}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {text: "证书签发请求提交成功"})
     }
     if (orders_data.status === 'processing') {
         console.log('Orders Remote Finish Status:', "Certificate Processing");
-        await saves.updateDB(env.DB_CF, "Apply", {text: "证书正在等待完成签发"}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {text: "证书正在等待完成签发"})
     }
     if (orders_data.status === 'valid') {
         const certificate: any = await client_data.getCertificate(orders_data);// 获取证书
@@ -465,19 +466,18 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
         // 若它缺失（老数据 / 异常中断）则保留原 keys，避免把私钥写没。
         const pendingKeys = order_info['pending_keys'];
         const hasPending = typeof pendingKeys === "string" && pendingKeys.length > 0;
-        await saves.updateDB(
-            env.DB_CF, "Apply",
+        await dao.updateApply(
+            order_info['uuid'],
             hasPending
                 ? {cert: certificate, keys: pendingKeys, pending_keys: ""}
-                : {cert: certificate},
-            {uuid: order_info['uuid']}
+                : {cert: certificate}
         );
         if (!hasPending) {
             console.warn(
                 `[certs] 订单 ${order_info['uuid']} 缺少 pending_keys，保留原私钥`
             );
         }
-        await saves.updateDB(env.DB_CF, "Apply", {flag: 5}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {flag: 5})
         // 到期时间：优先用证书里真实的 notAfter（CA 不一定是 90 天，
         // 例如 ZeroSSL/Google 的策略会变），解析失败才回退到 +90 天。
         const validity = parseCertValidity(String(certificate ?? ""));
@@ -489,8 +489,8 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
             );
         }
         // 新证书：清空到期提醒标记，让下个周期的 expire7/expired 能重新推送
-        await saves.updateDB(env.DB_CF, "Apply", {next: timestamp, notified: ""}, {uuid: order_info['uuid']})
-        await saves.updateDB(env.DB_CF, "Apply", {text: "恭喜！证书已成功签发"}, {uuid: order_info['uuid']})
+        await dao.updateApply(order_info['uuid'], {next: timestamp, notified: ""})
+        await dao.updateApply(order_info['uuid'], {text: "恭喜！证书已成功签发"})
         // 通知（失败不抛异常，不影响主流程）
         await notify(env, {
             event: "success",
@@ -499,8 +499,7 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
             uuid: order_info['uuid'],
             detail: `有效期至 ${new Date(timestamp).toLocaleDateString('zh-CN')}`,
             siteHost: await siteHostOf(env),
-        });
-        // await saves.updateDB(env.DB, "Apply", {data: ""}, {uuid: order_info['uuid']})
+        }, ctx);
     }
     return {"texts": "处理成功"};
 }
@@ -515,15 +514,15 @@ export async function getCerts(env: D1Bindings, order_user: any, order_info: any
 //  5 cessationOfOperation   停止运营
 export const REVOKE_REASONS = new Set<number>([0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
 
-export async function revokeCert(env: D1Bindings, order_info: any, reason: number = 0) {
+export async function revokeCert(env: Bindings, order_info: any, reason: number = 0) {
+    const dao = await ensureDao(env as any);
     // 基本校验：必须存在证书原文 =====================================================================
     const cert_pem: string = order_info?.cert || "";
     if (!cert_pem || !/BEGIN CERTIFICATE/.test(cert_pem)) {
         return {"flags": 5, "texts": "当前订单未签发证书，无需吊销"};
     }
     // 读取申请者信息用于获取 ACME 账户上下文 =========================================================
-    let order_user: any = (await saves.selectDB(
-        env.DB_CF, "Users", {mail: {value: order_info['mail']}}))[0];
+    let order_user: any = await dao.getUser(order_info['mail']);
     if (!order_user) return {"flags": 5, "texts": "找不到订单对应的用户信息"};
     // 组装 ACME Client ============================================================================
     let client_data: any;
@@ -545,17 +544,14 @@ export async function revokeCert(env: D1Bindings, order_info: any, reason: numbe
         console.error("revokeCert acme error:", e);
         // 记录失败原因，但不修改订单状态，允许用户重新尝试
         try {
-            await saves.updateDB(env.DB_CF, "Apply",
-                {text: "证书吊销失败: " + msg},
-                {uuid: order_info['uuid']});
+            await dao.updateApply(order_info['uuid'], {text: "证书吊销失败: " + msg});
         } catch {/* ignore */}
         return {"flags": 5, "texts": "证书吊销失败: " + msg};
     }
     // 吊销成功：更新订单状态为已失效（-1），并清空 cert/keys，便于用户重新申请 =========================
     const timestamp = Date.now();
-    await saves.updateDB(env.DB_CF, "Apply",
-        {flag: -1, text: "证书已吊销 (reason=" + reason_code + ")", next: timestamp},
-        {uuid: order_info['uuid']});
+    await dao.updateApply(order_info['uuid'],
+        {flag: -1, text: "证书已吊销 (reason=" + reason_code + ")", next: timestamp});
     return {"flags": 0, "texts": "证书吊销成功"};
 }
 
@@ -594,7 +590,7 @@ async function safeDomainNames(order_info: any): Promise<string[]> {
 }
 
 /** 读取站点域名用于消息里的链接（读不到就返回空，消息里省略该行） */
-async function siteHostOf(env: D1Bindings): Promise<string | undefined> {
+async function siteHostOf(env: Bindings): Promise<string | undefined> {
     try {
         const {readConf} = await import("./db/conf");
         const host = (await readConf(env as any, "SITE_HOST")) ?? "";
@@ -605,7 +601,7 @@ async function siteHostOf(env: D1Bindings): Promise<string | undefined> {
 }
 
 // 获取操作接口 ####################################################################################
-async function getStart(env: D1Bindings, order_user: any, order_info: any) {
+async function getStart(env: Bindings, order_user: any, order_info: any) {
     let acme_url = acme_url_map[order_info['sign']];
     // 从 Confs 优先读取三家 CA 的账户凭据（回退到 env / 默认值）
     const [GTS_KeyTS, GTS_keyID, GTS_keyMC,

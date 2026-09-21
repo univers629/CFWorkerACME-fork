@@ -5,7 +5,9 @@ import type {
   ApplyPayload,
   Order,
   OrderAction,
-  OrderRaw,
+  OrderListQuery,
+  OrderStats,
+  OrderSummary,
 } from './types';
 
 /**
@@ -43,12 +45,36 @@ export async function fetchApplyQuota(): Promise<{
 }
 
 /**
- * 获取订单列表（全部）
+ * 获取订单列表（服务端过滤 + 分页）
+ * 返回摘要字段，不含 cert / keys 原文；需要原文时用 getOrder 或下载接口。
  */
-export async function listOrders(): Promise<OrderRaw[]> {
-  const data = await apiGet<ApiResp>('/order/', { id: 'all' });
+export async function listOrders(
+  params?: OrderListQuery,
+): Promise<{ items: OrderSummary[]; total: number; page: number; page_size: number }> {
+  const data = await apiGet<ApiResp>('/order/', { id: 'all', ...(params || {}) });
   if (data.flags !== 0) throw new Error(data.texts || '获取订单列表失败');
-  return (data.order || []) as OrderRaw[];
+  const d = data as any;
+  return {
+    items: (d.order || []) as OrderSummary[],
+    total: Number(d.total ?? 0),
+    page: Number(d.page ?? 1),
+    page_size: Number(d.page_size ?? 20),
+  };
+}
+
+/** 获取订单状态统计（覆盖全部订单，而非当前页） */
+export async function fetchOrderStats(): Promise<OrderStats> {
+  const data = await apiGet<ApiResp>('/order/stats');
+  if (data.flags !== 0) throw new Error(data.texts || '获取订单统计失败');
+  const d = data as any;
+  return {
+    total: Number(d.stats?.total ?? 0),
+    pending: Number(d.stats?.pending ?? 0),
+    verifying: Number(d.stats?.verifying ?? 0),
+    signed: Number(d.stats?.signed ?? 0),
+    expired: Number(d.stats?.expired ?? 0),
+    failed: Number(d.stats?.failed ?? 0),
+  };
 }
 
 /**
@@ -57,7 +83,7 @@ export async function listOrders(): Promise<OrderRaw[]> {
 export async function getOrder(uuid: string): Promise<Order> {
   const data = await apiGet<ApiResp>('/order/', { id: uuid });
   if (data.flags !== 0) throw new Error(data.texts || '获取订单失败');
-  const raw = data.order as OrderRaw;
+  const raw = data.order as OrderSummary & { cert?: string; keys?: string; data?: string };
   return {
     ...raw,
     main: safeJsonParse(raw.main) || {},

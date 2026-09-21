@@ -161,7 +161,7 @@ async function handleListOrders(c: Context<AppEnv>): Promise<Response> {
     const page = Math.max(1, parseInt(q.page ?? "1", 10) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(q.page_size ?? "20", 10) || 20));
     const dao = await ensureDao(c.env as any);
-    const {rows, total} = await dao.listApplies(
+    const {rows, total} = await dao.listApplySummaries(
         {eq: {mail: user.mail}},
         {page, pageSize, orderBy: "time", orderDesc: true},
     );
@@ -174,8 +174,8 @@ async function handleListOrders(c: Context<AppEnv>): Promise<Response> {
             uuid: r.uuid, flag: r.flag, time: r.time, next: r.next,
             sign: r.sign, type: r.type, auto: r.auto,
             main: r.main, list: r.list,
-            has_cert: !!(r.cert && r.cert.length > 0),
-            has_keys: !!(r.keys && r.keys.length > 0),
+            has_cert: !!r.has_cert,
+            has_keys: !!r.has_keys,
         })),
     });
 }

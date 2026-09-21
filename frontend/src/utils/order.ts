@@ -1,4 +1,4 @@
-import type { OrderRaw } from '@api/types';
+import type { OrderSummary } from '@api/types';
 
 /**
  * 订单业务状态分类（UI 显示级别，对后端 flag 做派生）
@@ -25,7 +25,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * 判断 flag=5 的已签发证书是否已过期
  * 规则：next 字段（下次续期/到期时间）存在且早于当前时间
  */
-export function isSignedExpired(o: OrderRaw): boolean {
+export function isSignedExpired(o: OrderSummary): boolean {
   if (o.flag !== 5) return false;
   if (!o.next) return false;
   return o.next < Date.now();
@@ -35,14 +35,14 @@ export function isSignedExpired(o: OrderRaw): boolean {
  * 判断待验证订单（flag 0/1/2）是否因超时被视为已失效
  * 规则：距订单创建时间（time）超过 PENDING_EXPIRE_DAYS 天
  */
-export function isPendingTimeout(o: OrderRaw): boolean {
+export function isPendingTimeout(o: OrderSummary): boolean {
   if (o.flag < 0 || o.flag > 2) return false;
   if (!o.time) return false;
   return Date.now() - o.time > PENDING_EXPIRE_DAYS * DAY_MS;
 }
 
 /** 派生当前订单的 UI 业务状态 */
-export function classifyFlag(o: OrderRaw): OrderStatus {
+export function classifyFlag(o: OrderSummary): OrderStatus {
   if (o.flag === -1) return 'failed';
   if (o.flag === 5) return isSignedExpired(o) ? 'expired' : 'signed';
   if (o.flag === 3 || o.flag === 4) return 'verifying';

@@ -3,7 +3,6 @@ import type {UserRow} from './db/dao'
 import {opDomain} from "./certs";
 import {cleanDNS} from "./query";
 import * as users from './users';
-import * as saves from './saves';
 import * as certs from './certs';
 import * as local from "hono/cookie";
 import {mountSetupRoutes} from "./routes/setup";
@@ -40,9 +39,9 @@ export type Bindings = {
 }
 
 /**
- * 需要「直接」操作 D1 的模块（certs.ts 等）使用的绑定类型。
- * 这些代码绕过 DAO 抽象直接调用 saves.selectDB(env.DB_CF, ...)，
- * 因此要求 DB_CF 必然存在；缺失时由调用方给出明确报错，而不是中途 TypeError。
+ * 明确要求 D1 绑定的环境类型。
+ * 供需要在编译期断言 DB_CF 存在的调用方（如定时任务入口）使用；
+ * 业务模块统一通过 DAO 访问数据，不直接依赖具体数据源。
  */
 export type D1Bindings = Bindings & { DB_CF: D1Database };
 
@@ -54,6 +53,130 @@ export type AppVariables = {
 
 /** 全项目统一的 Hono 环境类型（app / 各路由模块 / 中间件共用） */
 export type AppEnv = { Bindings: Bindings, Variables: AppVariables };
+
+/** 订单列表默认每页条数 */
+const ORDER_PAGE_SIZE_DEFAULT = 20;
+/** 订单列表最大每页条数 */
+const ORDER_PAGE_SIZE_MAX = 200;
+/** 待验证订单的失效宽限期（与前端 PENDING_EXPIRE_DAYS 一致） */
+const PENDING_EXPIRE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 派生状态过滤条件，与前端 classifyFlag 的判定保持一致：
+ *   signed     flag=5 且未过期（next=0 表示未记录到期时间，视为有效）
+ *   expired    flag=5 且已过期
+ *   verifying  flag=3/4
+ *   pending    flag=0/1/2 且未超过失效宽限期（time=0 视为未超时）
+ *   failed     flag=-1，或 flag=0/1/2 且已超过失效宽限期
+ * 使用 lte flag=4 等可命中 idx_apply_flag，避免全表扫描。
+ */
+function statusFilter(status: string): import("./db/dao").QueryFilter | null {
+    const now = Date.now();
+    switch (status) {
+        case "signed":
+            return {and: [{eq: {flag: 5}}, {or: [{eq: {next: 0}}, {gte: {next: now}}]}]};
+        case "expired":
+            return {and: [{eq: {flag: 5}}, {gte: {next: 1}}, {lte: {next: now - 1}}]};
+        case "verifying":
+            return {in: {flag: [3, 4]}};
+        case "pending":
+            return {
+                and: [
+                    {in: {flag: [0, 1, 2]}},
+                    {or: [{eq: {time: 0}}, {gte: {time: now - PENDING_EXPIRE_MS}}]},
+                ],
+            };
+        case "failed":
+            return {
+                or: [
+                    {eq: {flag: -1}},
+                    {
+                        and: [
+                            {in: {flag: [0, 1, 2]}},
+                            {gte: {time: 1}},
+                            {lte: {time: now - PENDING_EXPIRE_MS - 1}},
+                        ],
+                    },
+                ],
+            };
+        default:
+            return null;
+    }
+}
+
+/** 读取分页参数，做上下界收敛 */
+function readPaging(c: Context): { page: number; pageSize: number } {
+    const q = c.req.query();
+    const page = Math.max(1, parseInt(q.page ?? "1", 10) || 1);
+    const pageSize = Math.min(
+        ORDER_PAGE_SIZE_MAX,
+        Math.max(1, parseInt(q.page_size ?? String(ORDER_PAGE_SIZE_DEFAULT), 10) || ORDER_PAGE_SIZE_DEFAULT)
+    );
+    return {page, pageSize};
+}
+
+/**
+ * 构造本人订单的查询条件。
+ * status 为派生状态；"pending" 同时涵盖验证中（与列表页「处理中」筛选项一致）。
+ * q 为域名关键字，匹配 list 字段。
+ */
+function buildOwnOrderFilter(c: Context, mail: string): import("./db/dao").QueryFilter {
+    const status = String(c.req.query("status") ?? "all");
+    const keyword = String(c.req.query("q") ?? "").trim();
+
+    const filter: import("./db/dao").QueryFilter = {eq: {mail}};
+    if (status === "pending") {
+        // 「处理中」= 待验证 + 验证中
+        filter.and = [{or: [statusFilter("pending")!, statusFilter("verifying")!]}];
+    } else {
+        const sub = statusFilter(status);
+        if (sub) filter.and = [sub];
+    }
+
+    // 关键字同时匹配域名（list 字段）与订单号，与原前端搜索行为一致
+    if (keyword) {
+        filter.and = [
+            ...(filter.and ?? []),
+            {or: [{like: {list: keyword}}, {like: {uuid: keyword}}]},
+        ];
+    }
+    return filter;
+}
+
+/**
+ * 用户订单列表：服务端过滤 + 分页，只返回摘要字段（不含 cert / keys / data）。
+ */
+async function listOwnOrders(
+    c: Context,
+    dao: import("./db/dao").Dao,
+    mail: string
+): Promise<{ rows: Record<string, any>[]; total: number }> {
+    const {page, pageSize} = readPaging(c);
+    return await dao.listApplySummaries(buildOwnOrderFilter(c, mail), {
+        page, pageSize, orderBy: "time", orderDesc: true,
+    }) as any;
+}
+
+/**
+ * 订单状态统计：对全部本人订单按派生状态计数。
+ * 首页需要完整统计，分页后无法由单页数据推导，因此单独用 COUNT 查询。
+ */
+async function countOwnOrderStats(
+    c: Context,
+    dao: import("./db/dao").Dao,
+    mail: string
+): Promise<Record<string, number>> {
+    const base = {eq: {mail}};
+    const [total, signed, expired, verifying, pending, failed] = await Promise.all([
+        dao.countApplies(base),
+        dao.countApplies({and: [base, statusFilter("signed")!]}),
+        dao.countApplies({and: [base, statusFilter("expired")!]}),
+        dao.countApplies({and: [base, statusFilter("verifying")!]}),
+        dao.countApplies({and: [base, statusFilter("pending")!]}),
+        dao.countApplies({and: [base, statusFilter("failed")!]}),
+    ]);
+    return {total, pending, verifying, signed, expired, failed};
+}
 
 export const app = new Hono<AppEnv>()
 
@@ -135,7 +258,8 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
 
         // console.log(domain_save);
         let uuid = await users.newNonce(16)
-        await saves.insertDB(c.env.DB_CF, "Apply", {
+        const applyDao = await (await import("./db")).ensureDao(c.env as any);
+        await applyDao.insertApply({
             uuid: uuid,
             mail: local.getCookie(c, 'mail'),
             sign: upload_json['globals']['ca'],
@@ -149,17 +273,16 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
             cert: "",
             next: new Date(new Date().setDate(new Date().getDate() + 7)).getTime(),
             text: "订单提交成功",
-        })
+        } as any)
         // 创建订单后立即推进一次状态机（生成 ACME 订单 + 写入 TXT 挑战记录）
         // 若推进失败（如 ACME 服务端拒绝），把错误原因回显给前端，便于用户即时看到失败原因
         let apply_warn: string | null = null;
         try {
-            await certs.processOne(c.env, uuid);
+            await certs.processOne(c.env, uuid, c.executionCtx);
             // 再查一次订单，如果已经被置为失败状态（flag=-1），把 text 作为警告返回
-            const fresh: any = await saves.selectDB(
-                c.env.DB_CF, "Apply", {uuid: {value: uuid}});
-            if (fresh && fresh[0] && Number(fresh[0].flag) < 0) {
-                apply_warn = String(fresh[0].text || "证书申请处理失败");
+            const fresh = await applyDao.getApply(uuid);
+            if (fresh && Number(fresh.flag) < 0) {
+                apply_warn = String(fresh.text || "证书申请处理失败");
             }
         } catch (e) {
             const {extractAcmeError} = await import("./certs");
@@ -205,6 +328,22 @@ app.get('/apply/quota', async (c: Context): Promise<Response> => {
     }
 });
 
+// 订单状态统计 ###############################################################################
+// 首页概览需要全部订单的派生状态计数；列表分页后无法由单页推导，故单独提供。
+app.get('/order/stats', async (c: Context): Promise<Response> => {
+    if (!await users.userAuth(c)) return c.json({"flags": 2, "texts": "用户尚未登录"}, 401);
+    const mail = local.getCookie(c, 'mail');
+    if (!mail) return c.json({"flags": 4, "texts": "用户尚未登录"}, 401);
+    try {
+        const {ensureDao} = await import("./db");
+        const dao = await ensureDao(c.env as any);
+        const stats = await countOwnOrderStats(c, dao, mail);
+        return c.json({"flags": 0, "stats": stats}, 200);
+    } catch (e: any) {
+        return c.json({"flags": 3, "texts": "请求数据无效: " + (e?.message ?? e)}, 400);
+    }
+})
+
 // 获取订单 ###############################################################################
 app.use('/order/', async (c: Context): Promise<Response> => {
     if (c.req.method !== 'GET') return c.json({"flags": 1, "texts": "请求方式无效"}, 400);
@@ -217,30 +356,38 @@ app.use('/order/', async (c: Context): Promise<Response> => {
     if (!user_email) return c.json({"flags": 4, "texts": "用户尚未登录"}, 401);
     // 读取数据 ============================================================================
     try {
+        const {ensureDao} = await import("./db");
+        const dao = await ensureDao(c.env as any);
         let order_data: Record<string, any>[];
+        let list_total = 0;
         if (order_uuid == "all") {
-            order_data = await saves.selectDB(c.env.DB_CF, "Apply", {
-                mail: {value: user_email}
-            });
-            // console.log(user_email, order_data)
+            const listed = await listOwnOrders(c, dao, user_email);
+            order_data = listed.rows;
+            list_total = listed.total;
         } else {
-            order_data = await saves.selectDB(c.env.DB_CF, "Apply", {
-                uuid: {value: order_uuid},
-                mail: {value: user_email}
-            });
+            const one = await dao.getApply(order_uuid);
+            order_data = (one && String(one.mail) === user_email) ? [one as any] : [];
         }
         // if (order_data.length < 1)
         //     return c.json({"flags": 6, "texts": "请求订单无效"}, 400);
         if (order_acts == undefined || order_acts === "") { // 获取订单信息 -----------
-            let order_save: any = order_uuid == "all" ? order_data : order_data[0];
-            return c.json({"flags": 0, "order": order_save}, 200);
+            if (order_uuid == "all") {
+                const {page, pageSize} = readPaging(c);
+                return c.json({
+                    "flags": 0,
+                    "order": order_data,
+                    "total": list_total,
+                    "page": page,
+                    "page_size": pageSize,
+                }, 200);
+            }
+            return c.json({"flags": 0, "order": order_data[0]}, 200);
         } else { // 对订单执行操作 ----------------------------------------------------------
             if (order_acts === "verify" && order_data[0].flag == 2) {// 提交验证请求
-                await saves.updateDB(c.env.DB_CF, "Apply", {flag: 3}, {uuid: order_uuid})
+                await dao.updateApply(order_uuid, {flag: 3})
                 let order_info = order_data[0]; // 获取当前订单详细情况
                 let order_mail = order_info['mail']; // 当前订单用户邮箱
-                let order_user: any = (await saves.selectDB( // 查询申请者信息
-                    c.env.DB_CF, "Users", {mail: {value: order_mail}}))[0];
+                let order_user: any = await dao.getUser(order_mail);
                 await opDomain(c.env, order_user, order_info, ["all"]);
             } else if (order_acts === "process") { // 立即按当前 flag 一键推进到底
                 let order_info = order_data[0]; // 获取当前订单详细情况
@@ -248,36 +395,33 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                 if (cur_flag === 5 || cur_flag < 0)
                     return c.json({"flags": 0, "texts": "当前订单无需处理", "order": order_acts});
                 if (cur_flag === 2) { // 等待 DNS 配置阶段：立即触发一次验证，再推进到底
-                    await saves.updateDB(c.env.DB_CF, "Apply", {flag: 3}, {uuid: order_uuid});
+                    await dao.updateApply(order_uuid, {flag: 3});
                     let order_mail = order_info['mail'];
-                    let order_user: any = (await saves.selectDB(
-                        c.env.DB_CF, "Users", {mail: {value: order_mail}}))[0];
-                    let fresh_info: any = (await saves.selectDB(
-                        c.env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+                    let order_user: any = await dao.getUser(order_mail);
+                    let fresh_info: any = await dao.getApply(order_uuid);
                     await opDomain(c.env, order_user, fresh_info, ["all"]);
                 }
-                await certs.processOne(c.env, order_uuid);
+                await certs.processOne(c.env, order_uuid, c.executionCtx);
             } else if (order_acts === "reload")
-                await saves.updateDB(c.env.DB_CF, "Apply", {flag: 0}, {uuid: order_uuid})
+                await dao.updateApply(order_uuid, {flag: 0})
             else if (order_acts === "modify" || order_acts === "cancel")
-                await saves.deleteDB(c.env.DB_CF, "Apply", {uuid: order_uuid})
+                await dao.deleteApply(order_uuid)
             else if (order_acts === "single") {
                 order_acts += "-" + order_push
                 if (order_push == undefined || order_push == "undefined")
                     return c.json({"flags": 5, "texts": "请求操作无效", "order": order_acts});
                 let order_info = order_data[0]; // 获取当前订单详细情况
                 let order_mail = order_info['mail']; // 当前订单用户邮箱
-                let order_user: any = (await saves.selectDB( // 查询申请者信息
-                    c.env.DB_CF, "Users", {mail: {value: order_mail}}))[0];
+                let order_user: any = await dao.getUser(order_mail);
                 await opDomain(c.env, order_user, order_info, [order_push]);
             } else if (order_acts === "ca_get") {
                 order_acts = order_data[0].cert;
             } else if (order_acts === "ca_key") {
                 order_acts = order_data[0].keys;
             } else if (order_acts === "re_new") {
-                await saves.updateDB(c.env.DB_CF, "Apply", {flag: 0}, {uuid: order_uuid})
+                await dao.updateApply(order_uuid, {flag: 0})
             } else if (order_acts === "rm_key") {
-                await saves.updateDB(c.env.DB_CF, "Apply", {keys: ""}, {uuid: order_uuid})
+                await dao.updateApply(order_uuid, {keys: ""})
             } else if (order_acts === "ca_del") {
                 // 吊销证书：支持通过 cd 参数传递 RFC5280 吊销原因码（数字 0/1/3/4/5 等）
                 let order_info = order_data[0];
@@ -343,13 +487,13 @@ app.get('/exits/', async (c: Context): Promise<Response> => {
 
 // 定时任务 ###############################################################################
 app.get('/tests/', async (c: Context): Promise<Response> => {
-    let result: any[] = await certs.Processing(c.env);
+    let result: any[] = await certs.Processing(c.env, c.executionCtx);
     return c.json(result)
 })
 
 // 定时任务 ###############################################################################
 app.get('/tasks/', async (c: Context): Promise<Response> => {
-    let result: any[] = await certs.Processing(c.env);
+    let result: any[] = await certs.Processing(c.env, c.executionCtx);
     return c.json(result)
 })
 
@@ -359,7 +503,8 @@ app.use('/acmes/', async (c: Context): Promise<Response> => {
     if (!await users.userAuth(c)) return c.json({"flags": 2, "texts": "用户尚未登录"}, 401);
     let user_email: string | undefined = local.getCookie(c, 'mail')
     let privateKey: string = <string>(await c.req.json())['privateKey'];
-    await saves.updateDB(c.env.DB_CF, "Users", {keys: privateKey}, {mail: user_email})
+    const acmeDao = await (await import("./db")).ensureDao(c.env as any);
+    await acmeDao.updateUser(String(user_email), {keys: privateKey})
     return c.json({"flags": 0, "texts": "更新ACME密钥成功"}, 200)
 })
 
@@ -370,8 +515,9 @@ app.use('/erase/', async (c: Context): Promise<Response> => {
     let user_email: string | undefined = local.getCookie(c, 'mail')
     let post_email: string = <string>(await c.req.json())['email'];
     if (user_email != post_email) return c.json({"flags": 5, "texts": "用户邮箱无效"}, 403);
-    await saves.deleteDB(c.env.DB_CF, "Apply", {mail: user_email})
-    await saves.deleteDB(c.env.DB_CF, "Users", {mail: user_email})
+    const eraseDao = await (await import("./db")).ensureDao(c.env as any);
+    await eraseDao.deleteAppliesByMail(String(user_email))
+    await eraseDao.deleteUser(String(user_email))
     return c.json({"flags": 0, "texts": "删除账号成功"}, 200)
 })
 
@@ -381,7 +527,8 @@ app.use('/token/', async (c: Context): Promise<Response> => {
     if (!await users.userAuth(c)) return c.json({"flags": 2, "texts": "用户尚未登录"}, 401);
     let user_email: string | undefined = local.getCookie(c, 'mail')
     let apis_token: string = <string>(await c.req.json())['privateKey'];
-    await saves.updateDB(c.env.DB_CF, "Users", {apis: apis_token}, {mail: user_email})
+    const tokenDao = await (await import("./db")).ensureDao(c.env as any);
+    await tokenDao.updateUser(String(user_email), {apis: apis_token})
     return c.json({"flags": 0, "texts": "更新API TOKEN密钥成功"}, 200)
 })
 
@@ -397,20 +544,19 @@ app.use('/certs/:uuid', async (c: Context): Promise<any> => {
     const api_token: string | undefined = c.req.query('keys');
     if (cert_uuid === undefined || api_token === undefined)
         return c.json({"flags": 1, "texts": "证书订单ID或密钥无效"}, 400);
-    const now_order: any = await saves.selectDB(
-        c.env.DB_CF, "Apply", {uuid: {value: cert_uuid}});
-    if (now_order.length == 0)
+    const certDao = await (await import("./db")).ensureDao(c.env as any);
+    const now_order: any = await certDao.getApply(cert_uuid);
+    if (!now_order)
         return c.json({"flags": 3, "texts": "证书订单ID或密钥无效"}, 400);
-    const now_email: string = now_order[0]['mail'];
-    const now_users: any = await saves.selectDB(
-        c.env.DB_CF, "Users", {mail: {value: now_email}});
-    if (now_users.length == 0 || now_users[0]['apis'] != api_token)
+    const now_email: string = now_order['mail'];
+    const now_users: any = await certDao.getUser(now_email);
+    if (!now_users || now_users['apis'] != api_token)
         return c.json({"flags": 3, "texts": "证书订单ID或密钥无效"}, 400);
-    if (now_order[0].cert.length == 0 || now_order[0].keys.length == 0)
+    if (!now_order.cert || !now_order.keys)
         return c.json({"flags": 4, "texts": "此订单未完成或无密钥"}, 400);
     return c.json({
         "flags": 0, "texts": "证书密钥信息获取成功",
-        "cert": now_order[0].cert, "keys": now_order[0].keys
+        "cert": now_order.cert, "keys": now_order.keys
     }, 200)
 })
 

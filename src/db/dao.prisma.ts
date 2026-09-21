@@ -8,7 +8,7 @@
  */
 
 import type {
-    Dao, UserRow, ApplyRow, ConfRow, QueryFilter, Pagination
+    Dao, UserRow, ApplyRow, ApplySummaryRow, ConfRow, QueryFilter, Pagination
 } from "./dao";
 
 export class PrismaDao implements Dao {
@@ -40,6 +40,10 @@ export class PrismaDao implements Dao {
         for (const [k, v] of Object.entries(filter.gte ?? {})) AND.push({[k]: {gte: v}});
         for (const [k, v] of Object.entries(filter.lte ?? {})) AND.push({[k]: {lte: v}});
         for (const [k, v] of Object.entries(filter.in ?? {})) AND.push({[k]: {in: v}});
+        for (const sub of filter.and ?? []) AND.push(this.where(sub));
+        const or = (filter.or ?? []).map((sub) => this.where(sub)).filter((w) => Object.keys(w).length > 0);
+        if (or.length === 1) AND.push(or[0]);
+        else if (or.length > 1) AND.push({OR: or});
         return AND.length > 0 ? {AND} : {};
     }
 
@@ -149,14 +153,40 @@ export class PrismaDao implements Dao {
         return r ? this.fromApply(r) : null;
     }
 
-    async listApplies(filter?: QueryFilter, page?: Pagination) {
+    async scanApplies(filter?: QueryFilter): Promise<ApplyRow[]> {
+        const c = await this.getClient();
+        const rows = await c.apply.findMany({where: this.where(filter)});
+        return rows.map((r: any) => this.fromApply(r));
+    }
+
+    async countApplies(filter?: QueryFilter): Promise<number> {
+        const c = await this.getClient();
+        return c.apply.count({where: this.where(filter)});
+    }
+
+    async listApplySummaries(filter?: QueryFilter, page?: Pagination) {
         const c = await this.getClient();
         const where = this.where(filter);
         const [rows, total] = await Promise.all([
-            c.apply.findMany({where, orderBy: this.orderBy(page), ...this.pageArgs(page)}),
+            c.apply.findMany({
+                where,
+                orderBy: this.orderBy(page),
+                ...this.pageArgs(page),
+                select: {
+                    uuid: true, mail: true, sign: true, type: true, auto: true, flag: true,
+                    time: true, next: true, main: true, list: true, text: true,
+                    cert: true, keys: true,
+                },
+            }),
             c.apply.count({where}),
         ]);
-        return {rows: rows.map((r: any) => this.fromApply(r)), total};
+        return {
+            rows: rows.map((r: any) => {
+                const base = this.fromApply({...r, cert: null, keys: null});
+                return {...base, has_cert: r.cert ? 1 : 0, has_keys: r.keys ? 1 : 0} as ApplySummaryRow;
+            }),
+            total,
+        };
     }
 
     async insertApply(row: ApplyRow): Promise<void> {

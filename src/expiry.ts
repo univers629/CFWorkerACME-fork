@@ -14,10 +14,10 @@
  *       续期成功后 next 会被更新，届时由调用方清空 notified 以便下个周期重新提醒。
  */
 
-import * as saves from "./saves";
-import {notify} from "./notify";
+import {ensureDao} from "./db";
+import {notify, type BackgroundContext} from "./notify";
 import {readConf} from "./db/conf";
-import type {D1Bindings} from "./index";
+import type {Bindings} from "./index";
 
 /** 7 天的毫秒数 */
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -50,15 +50,18 @@ function domainListOf(order: any): string[] {
 /**
  * 扫描所有已签发证书，按需推送到期提醒。
  * 返回 {expire7, expired} 两个计数，便于 cron 打日志。
- * **不抛异常**：任何单个订单的失败都不会中断整轮扫描。
+ * 不抛异常：任何单个订单的失败都不会中断整轮扫描。
+ * @param ctx 可选：传入后通知改为后台推送
  */
-export async function scanExpiry(env: D1Bindings): Promise<{ expire7: number; expired: number }> {
+export async function scanExpiry(env: Bindings, ctx?: BackgroundContext): Promise<{ expire7: number; expired: number }> {
     const result = {expire7: 0, expired: 0};
 
+    let dao;
     let orders: any[] = [];
     try {
+        dao = await ensureDao(env as any);
         // flag=5 表示已签发；next 为到期时间戳
-        orders = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5}});
+        orders = await dao.scanApplies({eq: {flag: 5}});
     } catch (e) {
         console.error("[expiry] 查询已签发订单失败", e);
         return result;
@@ -95,15 +98,11 @@ export async function scanExpiry(env: D1Bindings): Promise<{ expire7: number; ex
                     ? "证书已过期，请尽快重新申请"
                     : `剩余 ${days} 天，将自动续期（若已开启自动续期）`,
                 siteHost,
-            });
+            }, ctx);
 
             // 记录已提醒；注意先写库再计数，避免推送成功但标记失败导致重复轰炸
             done.add(event);
-            await saves.updateDB(
-                env.DB_CF, "Apply",
-                {notified: [...done].join(",")},
-                {uuid: order.uuid}
-            );
+            await dao.updateApply(String(order.uuid), {notified: [...done].join(",")});
             result[event]++;
         } catch (e) {
             console.error(`[expiry] 处理订单 ${order?.uuid} 失败`, e);

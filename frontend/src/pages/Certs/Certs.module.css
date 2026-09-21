@@ -392,3 +392,10 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 分页 ---------- */
+.pager {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}

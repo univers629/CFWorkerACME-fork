@@ -9,10 +9,11 @@
  * 服务器不会因一次失败而拉不到证书。
  */
 
-import * as saves from "./saves";
+import {ensureDao} from "./db";
+import type {Dao} from "./db/dao";
 import {readBool, readInt} from "./db/conf";
-import {notify} from "./notify";
-import type {D1Bindings} from "./index";
+import {notify, type BackgroundContext} from "./notify";
+import type {Bindings} from "./index";
 
 /** 默认提前多少天续期 */
 const DEFAULT_RENEW_DAYS = 30;
@@ -46,8 +47,9 @@ const STUCK_MARK = "renew_stuck";
 /**
  * 扫描并触发自动续期。
  * 不抛异常：单个订单失败不影响其它订单，也不影响调用方（cron）。
+ * @param ctx 可选：传入后通知改为后台推送，不阻塞调用方
  */
-export async function scanAutoRenew(env: D1Bindings): Promise<RenewScanResult> {
+export async function scanAutoRenew(env: Bindings, ctx?: BackgroundContext): Promise<RenewScanResult> {
     const result: RenewScanResult = {triggered: 0, scanned: 0, disabled: false, uuids: [], stuck: 0};
 
     const enabled = await readBool(env as any, "AUTO_RENEW_ENABLED", true);
@@ -60,9 +62,12 @@ export async function scanAutoRenew(env: D1Bindings): Promise<RenewScanResult> {
     const thresholdMs = Math.max(1, days) * 24 * 60 * 60 * 1000;
     const now = Date.now();
 
+    let dao: Dao;
     let orders: any[] = [];
     try {
-        orders = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5}});
+        dao = await ensureDao(env as any);
+        // flag=5 为已签发订单，命中 idx_apply_flag
+        orders = await dao.scanApplies({eq: {flag: 5}});
     } catch (e) {
         console.error("[renew] 查询已签发订单失败", e);
         return result;
@@ -88,16 +93,12 @@ export async function scanAutoRenew(env: D1Bindings): Promise<RenewScanResult> {
 
             // 重置为 0，交由状态机重新走完整签发流程。
             // 保留 cert/keys，续期失败时旧证书仍可下载。
-            await saves.updateDB(
-                env.DB_CF, "Apply",
-                {
-                    flag: 0,
-                    text: `[auto-renew] 距到期 ${remainDays} 天，已自动发起续期`,
-                    // 清空上次的到期提醒标记，让新证书能重新提醒
-                    notified: "",
-                },
-                {uuid: order.uuid}
-            );
+            await dao.updateApply(String(order.uuid), {
+                flag: 0,
+                text: `[auto-renew] 距到期 ${remainDays} 天，已自动发起续期`,
+                // 清空上次的到期提醒标记，让新证书能重新提醒
+                notified: "",
+            });
             result.triggered++;
             result.uuids.push(String(order.uuid));
         } catch (e) {
@@ -108,7 +109,7 @@ export async function scanAutoRenew(env: D1Bindings): Promise<RenewScanResult> {
     // 第二遍：提醒「已发起续期但卡在人工验证」的订单。
     // 这类订单已离开 flag=5，expiry 扫描覆盖不到，旧证书到期前不会有任何提醒。
     try {
-        result.stuck = await notifyStuckRenewals(env, thresholdMs, now);
+        result.stuck = await notifyStuckRenewals(env, thresholdMs, now, ctx);
     } catch (e) {
         console.error("[renew] 卡住订单扫描失败", e);
     }
@@ -121,11 +122,13 @@ export async function scanAutoRenew(env: D1Bindings): Promise<RenewScanResult> {
  * 通过 notified 里的 renew_stuck 标记去重，同一订单只提醒一次。
  */
 async function notifyStuckRenewals(
-    env: D1Bindings, thresholdMs: number, now: number
+    env: Bindings, thresholdMs: number, now: number, ctx?: BackgroundContext
 ): Promise<number> {
+    let dao;
     let rows: any[] = [];
     try {
-        rows = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 2}});
+        dao = await ensureDao(env as any);
+        rows = await dao.scanApplies({eq: {flag: 2}});
     } catch (e) {
         console.error("[renew] 查询 flag=2 订单失败", e);
         return 0;
@@ -158,14 +161,10 @@ async function notifyStuckRenewals(
                     `自动续期已发起，但订单停在「等待域名验证」，` +
                     `旧证书 ${remainDays} 天后到期。请登录后台完成验证。`,
                 siteHost: (await readConfHost(env)) || undefined,
-            });
+            }, ctx);
 
             marks.add(STUCK_MARK);
-            await saves.updateDB(
-                env.DB_CF, "Apply",
-                {notified: [...marks].join(",")},
-                {uuid: row.uuid}
-            );
+            await dao.updateApply(String(row.uuid), {notified: [...marks].join(",")});
             sent++;
         } catch (e) {
             console.error(`[renew] 提醒卡住订单 ${row?.uuid} 失败`, e);
@@ -186,7 +185,7 @@ function safeDomains(list: any): string[] {
 }
 
 /** 读站点域名（用于通知里的链接）；读不到返回空串 */
-async function readConfHost(env: D1Bindings): Promise<string> {
+async function readConfHost(env: Bindings): Promise<string> {
     try {
         const {readConf} = await import("./db/conf");
         return (await readConf(env as any, "SITE_HOST")) ?? "";
