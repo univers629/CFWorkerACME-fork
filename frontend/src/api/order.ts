@@ -75,9 +75,10 @@ export async function fetchOrderStats(): Promise<OrderStats> {
 
 /**
  * 获取单个订单
+ * @param silent 后台轮询时为 true：失败不弹全局 toast
  */
-export async function getOrder(uuid: string): Promise<Order> {
-  const data = await apiGet<ApiResp>('/order/', { id: uuid });
+export async function getOrder(uuid: string, silent = false): Promise<Order> {
+  const data = await apiGet<ApiResp>('/order/', { id: uuid }, { silent });
   if (data.flags !== 0) throw new Error(data.texts || '获取订单失败');
   const raw = data.order as OrderSummary & { cert?: string; keys?: string; data?: string };
   return {

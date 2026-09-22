@@ -37,7 +37,7 @@ export default function OrderPage() {
     if (!uuid) return;
     if (!silent) setLoading(true);
     try {
-      const data = await getOrder(uuid);
+      const data = await getOrder(uuid, silent);
       setOrder(data);
     } catch {
       if (!silent) setOrder(null);
@@ -55,19 +55,30 @@ export default function OrderPage() {
   // 因此处于中间态的订单需要轮询才能看到进度变化。
   // 轮询有上限：后台任务若被截断，订单要等下一次 cron 才会变化，
   // 无上限轮询只会持续消耗 D1 读取配额。超时后由用户手动刷新。
+  //
+  // 用「上一轮结束再排下一轮」而非 setInterval：后者在请求变慢时会不断堆积
+  // 并发请求（3 秒一轮、每轮 30 秒才超时 → 最多十余个在途），既放大后端压力，
+  // 也让每个失败都触发一次提示。这里的轮询同时是 silent 的，失败不弹提示。
   const flag = order ? Number(order.flag) : undefined;
   const isProcessing = flag !== undefined && TRANSIENT_FLAGS.has(flag);
   useEffect(() => {
     if (!isProcessing) return;
+    let cancelled = false;
     let left = POLL_MAX_TICKS;
-    const timer = setInterval(() => {
-      if (--left <= 0) {
-        clearInterval(timer);
-        return;
-      }
-      load(true);
-    }, POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tick = async () => {
+      if (cancelled || --left <= 0) return;
+      await load(true);
+      if (cancelled) return;
+      timer = setTimeout(tick, POLL_INTERVAL_MS);
+    };
+    timer = setTimeout(tick, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isProcessing, uuid]);
 

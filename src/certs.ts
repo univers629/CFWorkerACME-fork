@@ -60,6 +60,32 @@ function isOrderExpired(orders_data: any): boolean {
     return Date.now() > ts;
 }
 
+// challenge 校验结果判定 ==========================================================================
+/**
+ * 把「等待 CA 校验」的结果映射为域名与订单的状态。
+ * -------------------------------------------------------------------------
+ * 独立成纯函数的原因：这段判定曾因漏掉 processing 状态而让订单永久停在
+ * 「申请中」并写下「域名验证通过」的错误文案，需要能被单元测试直接覆盖。
+ *
+ * @param waited valid=CA 确认通过；pending=仍在校验；error=等待过程抛错
+ * @returns domainFlag 域名状态；statusFlag 订单状态（null 表示不改动）；
+ *          retry 是否需要把「稍后重试」写入订单文案
+ */
+export function challengeOutcome(waited: "valid" | "pending" | "error"): {
+    domainFlag: number;
+    statusFlag: number | null;
+    retry: boolean;
+} {
+    if (waited === "valid") {
+        // 域名完成，订单状态保持不动：同一订单可能还有其它域名未验证，
+        // 由 status_flag 的初值（4）与其它域名的判定共同决定最终值。
+        return {domainFlag: 4, statusFlag: null, retry: false};
+    }
+    // pending / error 都必须把订单压回「验证中」，否则订单会带着未验证的
+    // 域名继续走到签发阶段。
+    return {domainFlag: 3, statusFlag: 3, retry: waited === "error"};
+}
+
 // 错误消息提取 ====================================================================================
 // 针对 acme-client / xior 抛出的错误对象，优先抽取 ACME Problem Details 中的友好信息，
 // 方便写入订单 text 字段后展示给用户。
@@ -444,29 +470,47 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             );
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
-            if (author_data.data['status'] == "invalid") { // 已有验证失败
+            // challenge 的状态集合是 pending | processing | valid | invalid（RFC 8555 §7.1.6）。
+            // 旧实现只判断了 invalid / pending / valid，processing 会从三个分支中间漏过去：
+            // 既不标记完成也不标记失败，而 status_flag 仍为初值 4，于是订单被置为
+            // 「申请中」并写下「域名验证通过」—— 状态卡死且文案与事实相反。
+            let ch_status: string = String(author_data.data['status'] ?? "")
+            if (ch_status == "invalid") { // 已有验证失败
                 domain_item.flag = -1;
                 status_flag = -1;
-            }
-            if (author_data.data['status'] == 'pending') {
+            } else if (ch_status == "valid") {
+                domain_item.flag = 4;
+            } else {
+                // pending：尚未提交，需要先 verifyChallenge / completeChallenge；
+                // processing：CA 已受理并在异步校验，只需等待。
+                let waited: "valid" | "pending" | "error" = "pending";
+                let waitErr: any = null;
                 try {
-                    let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
-                    console.log('Domain Server Verify Status:', upload_flag);
-                    let submit_flag = await client_data.completeChallenge(author_data.data);
-                    console.log('Domain Remote Upload Status:', submit_flag['status']);
+                    if (ch_status == 'pending') {
+                        let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
+                        console.log('Domain Server Verify Status:', upload_flag);
+                        let submit_flag: any = await client_data.completeChallenge(author_data.data);
+                        console.log('Domain Remote Upload Status:', submit_flag['status']);
+                    }
                     let result_flag = await client_data.waitForValidStatus(author_data.data);
                     console.log('Domain Remote Verify Status:', result_flag['status']);
-                    if (result_flag.status == "valid") {
-                        domain_item.flag = 4;
-                    }
+                    waited = result_flag.status == "valid" ? "valid" : "pending";
                 } catch (error) {
+                    // waitForValidStatus 超时或网络异常时 CA 可能仍在校验，不能直接判失败。
+                    // 保留 flag=3 交由下一轮 cron 继续；若确实被 CA 判为 invalid，
+                    // 下一轮 getAuthy 会取回 invalid 状态并走上面的失败分支。
                     console.log('Domain Remote Verify Errors:', error);
-                    domain_item.flag = -1;
-                    status_flag = -1;
+                    waited = "error";
+                    waitErr = error;
                 }
-            }
-            if (author_data.data['status'] == 'valid') {
-                domain_item.flag = 4;
+                const outcome = challengeOutcome(waited);
+                domain_item.flag = outcome.domainFlag;
+                if (outcome.statusFlag !== null) status_flag = outcome.statusFlag;
+                if (outcome.retry) {
+                    domain_fail.push(
+                        `${domain_item.name}: 验证尚未完成（${extractAcmeError(waitErr)}），稍后自动重试`
+                    );
+                }
             }
         }
         domain_save.push(domain_item);
@@ -481,6 +525,11 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     })
     else if (status_flag == 2) await dao.updateApply(order_info['uuid'], {
         text: "域名验证未通过：" + domain_fail.join("；")
+    })
+    else if (status_flag == 3) await dao.updateApply(order_info['uuid'], {
+        text: domain_fail.length
+            ? "域名验证进行中：" + domain_fail.join("；")
+            : "域名验证进行中，等待 CA 完成校验"
     })
     else await dao.updateApply(order_info['uuid'], {text: "域名验证通过"})
     return {"texts": "处理成功"};
@@ -501,6 +550,33 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
         await dao.updateApply(order_info['uuid'], {flag: 0})
         await dao.updateApply(order_info['uuid'], {text: "ACME 订单已过期，正在重新创建"})
         return {"texts": "订单已过期，重新创建"};
+    }
+    if (orders_data.status === 'pending') {
+        // ACME 订单仍是 pending：说明授权尚未全部通过，但本地 flag 已经是 4。
+        // 这通常来自历史上 dnsAuthy 漏判 processing 状态留下的脏数据，若不纠正，
+        // getCerts 会一直空转到订单过期。
+        //
+        // 只在「本地仍有域名未验证通过」时退回 flag=3：此时重跑验证是有意义的。
+        // 若本地域名已全部为 4 而 CA 仍报 pending，说明是 CA 侧的传播延迟或异常，
+        // 此时退回 flag=3 会让订单在 3/4 之间反复翻转（每轮 cron 一次），
+        // 因此保持原状等待，最终由订单过期逻辑回收重建。
+        const localPending = ((): boolean => {
+            try {
+                const items: any[] = JSON.parse(order_info['list'] ?? "[]");
+                return items.some((it: any) => Number(it?.flag ?? 0) < 4);
+            } catch {
+                return false;
+            }
+        })();
+        if (localPending) {
+            console.warn(`[certs] 订单 ${order_info['uuid']} 处于 pending 且本地验证未完成，退回 flag=3`);
+            await dao.updateApply(order_info['uuid'], {flag: 3})
+            await dao.updateApply(order_info['uuid'], {text: "域名验证尚未完成，正在重新校验"})
+            return {"texts": "域名验证尚未完成"};
+        }
+        console.warn(`[certs] 订单 ${order_info['uuid']} 本地已通过但 CA 仍为 pending，等待其完成`);
+        await dao.updateApply(order_info['uuid'], {text: "等待 CA 确认订单状态"})
+        return {"texts": "等待 CA 确认"};
     }
     if (orders_data.status == "invalid") {
         await dao.updateApply(order_info['uuid'], {flag: -1})

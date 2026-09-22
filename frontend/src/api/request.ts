@@ -72,7 +72,10 @@ instance.interceptors.response.use(
 
     if (err.response?.status === 401 || err.response?.data?.flags === 2) {
       onUnauthorized();
-    } else {
+    } else if (!(err.config as any)?.silent) {
+      // 后台轮询（silent）失败不弹 toast：轮询间隔只有数秒，
+      // 网络抖动或后端忙时会连续弹出同一句错误，把界面刷满。
+      // 失败信息由调用方按需展示（例如订单页保留上一次成功的数据）。
       toastError(finalMsg);
     }
     // 把业务错误文案注入到 reject 对象的 message 字段，
@@ -89,12 +92,16 @@ export const http = instance;
 
 /**
  * 便捷 GET（返回 data 部分）
+ *
+ * `silent: true` 表示后台轮询：失败时不弹全局 toast，由调用方自行处理。
+ * 该字段经 axios config 透传，拦截器通过 `err.config.silent` 读取。
  */
 export async function apiGet<T = ApiResp>(
   url: string,
   params?: Record<string, any>,
+  opts?: { silent?: boolean },
 ): Promise<T> {
-  const res = await instance.get<T>(url, { params });
+  const res = await instance.get<T>(url, { params, ...(opts as any) });
   return res.data;
 }
 
