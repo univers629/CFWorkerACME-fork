@@ -675,10 +675,14 @@ docker run -d --name certhub -p 3000:3000 \
 
 | 字段后缀 | 含义 | 示例 |
 | :--- | :--- | :--- |
-| `XXX_useIt` | 是否启用该 CA（`true` 启用；空字符串或留空表示禁用） | `true` |
+| `XXX_useIt` | 是否启用该 CA（`true` 启用，`false` 关闭；留空时按凭据是否齐全判定） | `true` |
 | `XXX_keyID` | EAB 账号 ID（External Account Binding Key ID） | `bfc7fb688d84` |
 | `XXX_keyMC` | EAB-MAC 密钥（HMAC Key） | `2SfXncG3Akx...` |
 | `XXX_KeyTS` | ACME 账号私钥（PEM 格式，需保留 `\n` 换行） | `-----BEGIN PRIVATE KEY-----\n...` |
+
+> 🔀 **关闭的厂商不再出现在申请页**，后端也会拒绝以该 CA 下单，
+> 避免绕过界面直接调用接口。留空时回退为「凭据齐全即启用」，
+> 保证仅配置凭据而未改动开关的部署不受影响。
 
 > 💡 **Let's Encrypt** 不需要 EAB，默认始终启用。但其在 Cloudflare Workers 上会出现 SSL 525 错误，需要使用 Nginx 反向代理（见下方[备注说明](#-备注说明)）。
 

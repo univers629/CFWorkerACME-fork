@@ -53,6 +53,8 @@ export interface BootstrapResult {
         provider: string;
         site_key: string;
     };
+    /** 当前启用、可供用户选择的 CA 标识；前端据此隐藏未启用的厂商 */
+    ca_signs: string[];
     /**
      * 初始化安全模式：
      *   preset —— 已用 ADMIN_MAIL/ADMIN_PASS 自动建好管理员，向导不开放
@@ -183,6 +185,9 @@ export async function handleBootstrap(c: Context<AppEnv>): Promise<Response> {
         (await safeRead(env, "CERT_CAPTCHA_SITE_KEY")) ||
         "";
 
+    const {enabledCaSigns} = await import("../ca");
+    const caSigns = await enabledCaSigns(env);
+
     const payload: BootstrapResult = {
         initialized,
         site_title: siteTitle,
@@ -193,6 +198,7 @@ export async function handleBootstrap(c: Context<AppEnv>): Promise<Response> {
         db_error: dbError,
         register_allow: registerAllow,
         register_code_required: registerCode.length > 0,
+        ca_signs: caSigns,
         cert_captcha: {
             enabled: captchaEnabled,
             provider: captchaProvider,

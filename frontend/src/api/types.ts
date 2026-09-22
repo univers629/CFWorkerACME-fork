@@ -23,6 +23,8 @@ export interface DomainItem {
   text?: string;
   auth?: string;
   auto?: string;
+  /** web-self（http-01）的挑战令牌，用于拼接验证文件路径与内容 */
+  token?: string;
 }
 
 /** 证书主体 */

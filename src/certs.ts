@@ -136,26 +136,6 @@ export function extractAcmeError(e: any): string {
     }
 }
 
-/**
- * 取出订单中验证记录由系统自动维护的域名（type=dns-auto）。
- * -------------------------------------------------------------------------
- * 状态机走到 flag=2 时，若 opDomain 收到空的 sets_list 便不写库，订单会停在
- * flag=2 直到用户手动点击验证。dns-auto 的记录由本系统增删，可直接推进。
- * dns-self / web-self 需人工放置记录或文件，不在返回值中。
- */
-export function autoVerifiableDomains(order_info: any): string[] {
-    try {
-        const list = JSON.parse(order_info['list'] ?? "[]");
-        if (!Array.isArray(list)) return [];
-        return list
-            .filter((d: any) => d?.type === "dns-auto" && Number(d?.flag ?? 0) < 4)
-            .map((d: any) => String(d?.name ?? ""))
-            .filter(Boolean);
-    } catch {
-        return [];
-    }
-}
-
 // 整体处理进程 ====================================================================================
 export async function Processing(env: Bindings, ctx?: BackgroundContext) {
     const dao = await ensureDao(env as any);
@@ -173,12 +153,7 @@ export async function Processing(env: Bindings, ctx?: BackgroundContext) {
             let order_user: any = await dao.getUser(order_mail); // 按不同阶段分配程序处理 ========================
             if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
             if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
-            if (order_info['flag'] == 2) {
-                // dns-auto 的域名由系统自己维护验证记录，直接推进验证；
-                // 其余（dns-self / web-self）传空数组，维持「等待人工」的原有语义。
-                const autos = autoVerifiableDomains(order_info);
-                result.push(await opDomain(env, order_user, order_info, autos));
-            }// 自动验证域名
+            if (order_info['flag'] == 2) result.push(await opDomain(env, order_user, order_info, []));// 等待用户配置 DNS 记录
             if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
             if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info, ctx));// 自动执行获取证书
         } finally {

@@ -114,7 +114,10 @@ async function handleCreateOrder(c: Context<AppEnv>): Promise<Response> {
         return c.json({code: "BAD_REQUEST", message: "缺少 domains"}, 400);
     }
 
-    const guard = await checkApplyGuard(c, {source: "api", user});
+    const guard = await checkApplyGuard(c, {
+        source: "api", user,
+        sign: body.globals?.ca ?? "lets-encrypt",
+    });
     if (!guard.ok) {
         return c.json({code: guard.code, message: guard.message}, guard.status as any);
     }

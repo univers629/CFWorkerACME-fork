@@ -22,6 +22,8 @@ export interface ApplyGuardOptions {
     source: ApplySource;
     user: UserRow;
     captchaToken?: string | null;
+    /** 本次申请使用的 CA 标识；提供时校验该 CA 是否已启用 */
+    sign?: string;
 }
 
 export interface ApplyGuardReject {
@@ -31,6 +33,7 @@ export interface ApplyGuardReject {
         | "CAPTCHA_INVALID"
         | "MONTHLY_LIMIT_EXCEEDED"
         | "QUOTA_EXCEEDED"
+        | "CA_DISABLED"
         | "INTERNAL";
     status: number;
     message: string;
@@ -87,8 +90,28 @@ export async function checkApplyGuard(
     c: Context,
     opts: ApplyGuardOptions,
 ): Promise<ApplyGuardResult> {
-    const {source, user, captchaToken} = opts;
+    const {source, user, captchaToken, sign} = opts;
     const env = c.env as any;
+
+    // ---------- 0) CA 启用状态 ----------
+    // 前端已隐藏未启用的厂商，这里再校验一次，避免绕过 UI 直接调用接口。
+    if (sign) {
+        try {
+            const {isCaEnabled, CA_LABELS} = await import("../ca");
+            if (!(await isCaEnabled(env, sign))) {
+                const label = CA_LABELS[sign] ?? sign;
+                return {
+                    ok: false,
+                    code: "CA_DISABLED",
+                    status: 403,
+                    message: `证书厂商 ${label} 当前未启用，请改用其它厂商`,
+                };
+            }
+        } catch (e) {
+            console.error("[applyGuard] CA 启用状态检查失败:", e);
+            // 读配置失败时不阻断申请，交由后续流程按凭据缺失报错
+        }
+    }
 
     // ---------- 1) 人机验证 ----------
     try {

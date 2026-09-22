@@ -353,6 +353,7 @@ export default function Apply() {
                   ca={state.ca}
                   autoRenew={state.auto_renew}
                   encryption={state.encryption}
+                  caSigns={bootstrap?.ca_signs}
                   onChange={updateGlobal}
                 />
               )}

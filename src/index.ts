@@ -284,6 +284,7 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
                 upload_json['captcha_token'] ??
                 upload_json['captchaToken'] ??
                 null,
+            sign: upload_json['globals']?.['ca'],
         });
         if (!guard.ok) {
             return c.json({

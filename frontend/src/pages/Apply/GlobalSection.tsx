@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Segmented, Switch } from 'antd';
 import { Cpu, Shield, ZapOff } from 'lucide-react';
 import SectionHeader from '@components/Layout/SectionHeader';
@@ -8,6 +9,8 @@ export interface GlobalSectionProps {
   ca: string;
   autoRenew: boolean;
   encryption: string;
+  /** 当前启用的 CA 标识；为空时展示全部（bootstrap 未返回该字段时的兼容行为） */
+  caSigns?: string[];
   onChange: (key: string, value: any) => void;
 }
 
@@ -15,8 +18,22 @@ export default function GlobalSection({
   ca,
   autoRenew,
   encryption,
+  caSigns,
   onChange,
 }: GlobalSectionProps) {
+  // 仅在 bootstrap 明确返回列表时过滤，避免旧版本响应导致选项全空
+  const options = caSigns?.length
+    ? SIGN_OPTIONS.filter((o) => caSigns.includes(o.value))
+    : SIGN_OPTIONS;
+
+  // 默认厂商可能已被管理员关闭，此时自动切到首个可用项，避免提交时被后端拒绝
+  useEffect(() => {
+    if (options.length === 0) return;
+    if (!options.some((o) => o.value === ca)) {
+      onChange('ca', options[0].value);
+    }
+  }, [ca, options, onChange]);
+
   return (
     <div className={styles.section}>
       <SectionHeader
@@ -30,7 +47,7 @@ export default function GlobalSection({
           <Shield size={13} /> 证书厂商
         </label>
         <div className={styles.caGrid}>
-          {SIGN_OPTIONS.map((opt) => (
+          {options.map((opt) => (
             <button
               type="button"
               key={opt.value}

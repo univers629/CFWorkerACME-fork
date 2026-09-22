@@ -32,6 +32,8 @@ export interface BootstrapInfo {
     provider: string;
     site_key: string;
   };
+  /** 当前启用、可供用户选择的 CA 标识；未列出的厂商不展示 */
+  ca_signs?: string[];
   /**
    * 初始化安全模式（后端返回）：
    *   preset —— 已用 ADMIN_MAIL/ADMIN_PASS 自动建好管理员，向导不开放

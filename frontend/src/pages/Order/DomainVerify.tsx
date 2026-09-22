@@ -66,11 +66,16 @@ function DomainPanel({
    */
   const isVerifiable = (orderFlag === 2 || orderFlag === 3) && flag < 4;
   const isDone = flag >= 4;
+  const isWeb = domain.type === 'web-self';
 
   const recordName = `_acme-challenge.${domain.name.replace(/^\*\./, '')}`;
   const recordType = domain.type === 'dns-auto' ? 'CNAME' : 'TXT';
   const recordValue =
     domain.type === 'dns-auto' ? domain.auto || '-' : domain.auth || '-';
+
+  // http-01 的验证材料：token 为文件名，auth 为文件内容
+  const webPath = `http://${domain.name.replace(/^\*\./, '')}/.well-known/acme-challenge/${domain.token || '<token>'}`;
+  const webContent = domain.auth || '-';
 
   return (
     <div className={styles.domainPanel}>
@@ -120,20 +125,33 @@ function DomainPanel({
             className={styles.domainPanelBody}
           >
             <div className={styles.domainPanelInner}>
-              <div className={styles.hint}>
-                请在您的 DNS 提供商中添加以下记录以完成验证：
-              </div>
-
-              <div className={styles.dnsTable}>
-                <DnsRow label="记录类型" value={recordType} />
-                <DnsRow label="记录名称" value={recordName} />
-                <DnsRow label="记录值" value={recordValue} mono />
-                <DnsRow
-                  label="验证命令"
-                  value={`nslookup -q=${recordType} ${recordName}`}
-                  mono
-                />
-              </div>
+              {isWeb ? (
+                <>
+                  <div className={styles.hint}>
+                    请在网站根目录下创建验证文件以完成验证：
+                  </div>
+                  <div className={styles.dnsTable}>
+                    <DnsRow label="文件路径" value={webPath} mono />
+                    <DnsRow label="文件内容" value={webContent} mono />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className={styles.hint}>
+                    请在您的 DNS 提供商中添加以下记录以完成验证：
+                  </div>
+                  <div className={styles.dnsTable}>
+                    <DnsRow label="记录类型" value={recordType} />
+                    <DnsRow label="记录名称" value={recordName} />
+                    <DnsRow label="记录值" value={recordValue} mono />
+                    <DnsRow
+                      label="验证命令"
+                      value={`nslookup -q=${recordType} ${recordName}`}
+                      mono
+                    />
+                  </div>
+                </>
+              )}
 
               <div className={styles.domainActions}>
                 <Button
