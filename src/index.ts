@@ -7,6 +7,7 @@ import {hmacSHA2} from "./users";
 import {readConf} from "./db/conf";
 import * as users from './users';
 import * as certs from './certs';
+import type {BackgroundContext} from "./notify";
 import * as local from "hono/cookie";
 import {mountSetupRoutes} from "./routes/setup";
 import {mountAdminUsersRoutes} from "./routes/admin_users";
@@ -56,6 +57,34 @@ export type AppVariables = {
 
 /** 全项目统一的 Hono 环境类型（app / 各路由模块 / 中间件共用） */
 export type AppEnv = { Bindings: Bindings, Variables: AppVariables };
+
+/**
+ * 把状态机推进交给响应之后的后台任务。
+ * ACME 的每次签名请求都会重新获取 nonce，而 newNonce 单次可达 8~32s。
+ * 走到「待验证」需 3 次串行签名请求（createOrder → getOrder → getAuthorizations），
+ * 按实测中位数约 30s，正好撞上前端 30s 请求超时；更长则触发 Cloudflare
+ * 网关 524（默认 125s 读超时）。
+ * 订单状态每步都持久化，后台任务被截断时由 cron 继续推进，不会丢单。
+ *
+ * Node.js 自托管（@hono/node-server）没有 ExecutionContext，读取
+ * c.executionCtx 会直接抛错；此时进程常驻，直接后台执行即可。
+ */
+function processInBackground(c: Context<AppEnv>, uuid: string, tag: string) {
+    let ctx: BackgroundContext | undefined;
+    try {
+        ctx = c.executionCtx as BackgroundContext;
+    } catch {
+        ctx = undefined;
+    }
+    const run = () => certs.processOne(c.env, uuid, ctx).catch((e) => {
+        console.error(`${tag} background processOne error:`, e);
+    });
+    if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(run());
+        return;
+    }
+    void run();
+}
 
 /** 订单列表默认每页条数 */
 const ORDER_PAGE_SIZE_DEFAULT = 20;
@@ -310,27 +339,9 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
             next: new Date(new Date().setDate(new Date().getDate() + 7)).getTime(),
             text: "订单提交成功",
         } as any)
-        // 创建订单后立即推进一次状态机（生成 ACME 订单 + 写入 TXT 挑战记录）
-        // 若推进失败（如 ACME 服务端拒绝），把错误原因回显给前端，便于用户即时看到失败原因
-        let apply_warn: string | null = null;
-        try {
-            await certs.processOne(c.env, uuid, c.executionCtx);
-            // 再查一次订单，如果已经被置为失败状态（flag=-1），把 text 作为警告返回
-            const fresh = await applyDao.getApply(uuid);
-            if (fresh && Number(fresh.flag) < 0) {
-                apply_warn = String(fresh.text || "证书申请处理失败");
-            }
-        } catch (e) {
-            const {extractAcmeError} = await import("./certs");
-            apply_warn = "证书申请处理失败: " + extractAcmeError(e);
-            console.error("apply processOne error:", e);
-        }
-        if (apply_warn) {
-            return c.json({
-                "flags": 11, "texts": apply_warn, "order": uuid,
-            }, 200);
-        }
-        return c.json({"flags": 0, "texts": "证书申请成功", "order": uuid}, 200);
+        // 订单已落库，状态机推进交由后台任务完成，接口立即返回以便前端轮询进度。
+        processInBackground(c, uuid, "apply");
+        return c.json({"flags": 0, "texts": "订单已提交，正在后台处理", "order": uuid}, 200);
     } catch (error) {
         return c.json({"flags": 3, "texts": "请求数据无效: " + error}, 400);
     }
@@ -425,6 +436,10 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                 let order_mail = order_info['mail']; // 当前订单用户邮箱
                 let order_user: any = await dao.getUser(order_mail);
                 await opDomain(c.env, order_user, order_info, ["all"]);
+                // opDomain 只负责把域名标记为待验证；实际验证与签发在此后台推进。
+                // 否则订单会停在 flag=3 直到下一次 cron。
+                // 本地 DNS 预检未通过时 dnsAuthy 会把订单退回 flag=2，可重试。
+                processInBackground(c, order_uuid, "verify");
             } else if (order_acts === "process") { // 立即按当前 flag 一键推进到底
                 let order_info = order_data[0]; // 获取当前订单详细情况
                 let cur_flag = Number(order_info['flag']);
@@ -437,7 +452,9 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                     let fresh_info: any = await dao.getApply(order_uuid);
                     await opDomain(c.env, order_user, fresh_info, ["all"]);
                 }
-                await certs.processOne(c.env, order_uuid, c.executionCtx);
+                // 与申请接口同理：ACME 交互耗时不可控，放到响应之后执行，
+                // 由前端轮询订单状态获取进度，cron 作为兜底继续推进。
+                processInBackground(c, order_uuid, "order");
             } else if (order_acts === "reload")
                 await dao.updateApply(order_uuid, {flag: 0})
             else if (order_acts === "modify" || order_acts === "cancel") {
@@ -454,6 +471,9 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                 let order_mail = order_info['mail']; // 当前订单用户邮箱
                 let order_user: any = await dao.getUser(order_mail);
                 await opDomain(c.env, order_user, order_info, [order_push]);
+                // 全部域名都已就绪时 opDomain 会把订单置为 flag=3，需后台推进；
+                // 仍有域名待验证时订单为 flag=2，processOne 会立即返回，无副作用。
+                processInBackground(c, order_uuid, "single");
             } else if (order_acts === "ca_get") {
                 order_acts = order_data[0].cert;
             } else if (order_acts === "ca_key") {

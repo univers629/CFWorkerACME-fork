@@ -66,6 +66,10 @@ export const FLAG_MAP: Record<string | number, string> = {
   '5': '已完成',
 };
 
+// 中间态：由后台任务/cron 自动推进，前端需轮询才能看到变化。
+// 不含 2（待验证，需用户配置 DNS 后手动触发）与 -1/5（终态）。
+export const TRANSIENT_FLAGS = new Set<number>([0, 1, 3, 4]);
+
 // 订单状态 → 颜色 token 名
 export const FLAG_COLOR: Record<string | number, string> = {
   '-1': 'err',

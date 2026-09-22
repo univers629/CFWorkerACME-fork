@@ -13,21 +13,17 @@ import type {
 /**
  * 申请新证书订单
  * @param captchaToken 当 CERT_CAPTCHA_ENABLED=true 时必填
- * @returns { uuid, warning? } 订单 UUID 及后端处理警告（如 ACME 拒绝原因）
+ * @returns 订单 UUID；ACME 推进在后台执行，失败原因经订单详情展示
  */
 export async function applyCert(
   payload: ApplyPayload,
   captchaToken?: string,
-): Promise<{ uuid: string; warning?: string }> {
+): Promise<{ uuid: string }> {
   const body: any = { ...payload };
   if (captchaToken) body.captcha_token = captchaToken;
   const data = await apiPost<ApiResp>('/apply/', body);
-  // flags===0  成功；flags===11 表示订单已创建但后端推进时失败，需把原因带回给 UI 展示
   if (data.flags === 0) {
     return { uuid: data.order as string };
-  }
-  if (data.flags === 11) {
-    return { uuid: data.order as string, warning: data.texts || '证书申请处理失败' };
   }
   throw new Error(data.texts || '申请失败');
 }

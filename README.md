@@ -90,7 +90,7 @@
 | TypeScript 6 弃用 `baseUrl` | `frontend/tsconfig.json(28,5): error TS5101: Option 'baseUrl' is deprecated`，构建直接中断 | 去掉 `baseUrl`，`paths` 改为 `"./src/*"` 相对写法；根目录显式锁 `typescript@^5.9.3` |
 | Workers Sites 已废弃 | `wrangler.jsonc` 用 `site.bucket` + 代码里 `__STATIC_CONTENT_MANIFEST`，需要额外的 KV 命名空间 | 升级为 Workers 静态资源（`assets` + `not_found_handling: single-page-application` + `run_worker_first` API 前缀），静态文件不再经过 Worker |
 | D1 占位符导致部署失败 | `database_id: "<database-id>"` 不是合法 UUID，`wrangler deploy` 必失败 | 删除 `database_id`，交给 wrangler ≥4.45 的自动资源创建；已建库的用户把 ID 填回即可 |
-| 定时任务空转 | `scheduled()` 只打日志，Cloudflare 上的订单永远不会自动推进/续期 | `scheduled()` 改为调用 `certs.Processing(env)`；cron 频率由 `*/5` 调整为每小时 |
+| 定时任务空转 | `scheduled()` 只打日志，Cloudflare 上的订单永远不会自动推进/续期 | `scheduled()` 改为调用 `certs.Processing(env)` |
 | 依赖臃肿 | 装了 900+ 个包（`@serverless-devs/s`、`edgeone` 及其 CLI 依赖、已被弃用的 `request`） | `edgeone`/`@edgeone/ef-types` 降为 devDependencies，移除从未被引用的 `@serverless-devs/s` |
 | 部署按钮 404 | 按钮指向不存在的 `CFWorkerACMEs` | 修正为 `CFWorkerACME`，并补充 Fork 部署说明 |
 | Worker 里 import 了 `wrangler` | `src/certs.ts` 有一行从未使用的 `import {errors} from "wrangler"`，打包时要解析 10MB+ 的开发期 CLI 包；一旦安装跳过 devDependencies 就直接打包失败 | 删除该行 |
@@ -224,7 +224,7 @@ npm install        # npm workspaces：根依赖 + frontend/ 前端依赖一次�
     }
   ],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
-  "triggers": { "crons": ["0 * * * *"] }
+  "triggers": { "crons": ["*/5 * * * *"] }
 }
 ```
 
@@ -649,7 +649,7 @@ docker run -d --name certhub -p 3000:3000 \
 | `AUTO_RENEW_ENABLED` | `true` | 总开关；设为 `false` 可整体停用自动续期 |
 | `AUTO_RENEW_DAYS` | `30` | 距到期不足该天数时触发续期 |
 
-> ⚙️ **工作原理**：cron 每小时扫描一次，命中窗口的订单被重置为 `flag=0`，
+> ⚙️ **工作原理**：cron 每 5 分钟扫描一次，命中窗口的订单被重置为 `flag=0`，
 > 由状态机重新走完「建单 → 验证 → 签发」，成功后刷新到期时间。
 >
 > 📅 **到期时间取自证书真实的 `notAfter`**（解析 X.509 有效期），
@@ -795,6 +795,25 @@ location /acme/ {
 ---
 
 ## ❓ 常见问题
+
+<details>
+<summary><b>Q：提交申请后状态停在「创建中 / 验证中」，要等多久？</b></summary>
+
+申请接口只负责落库，ACME 交互在响应之后的后台任务里执行，因此提交后立即返回，
+页面会轮询刷新状态（约 3 秒一次，最多 6 分钟）。
+
+这样设计的原因：ACME 每次签名请求都要重新获取 nonce，单次 `newNonce` 在
+ZeroSSL 上实测可达 8~32 秒。走到「待验证」需 3 轮串行签名请求
+（`createOrder` → `getOrder` → `getAuthorizations`），按实测中位数约 30 秒，
+正好撞上前端 30 秒请求超时（`timeout of 30000ms exceeded`），更长则触发
+Cloudflare 网关 `524`（默认 125 秒读超时）。
+
+后台任务本身只有 30 秒窗口，超时未完成的部分由 cron 续跑：
+Cloudflare Workers 为每 5 分钟，Node.js / Docker 自托管为每分钟（容器内 crontab），
+因此最坏情况等待分别约为 5 分钟和 1 分钟。轮询到上限后停止，点「刷新」可继续查看。
+需要人工配置 DNS 的 `dns-self` / `web-self` 订单仍会停在 `flag=2`，不会自动推进。
+
+</details>
 
 <details>
 <summary><b>Q：已经有 <code>acme.sh</code> 了，为什么还需要 CertHub？</b></summary>

@@ -14,7 +14,7 @@ import RevokeReasonSelect from '@components/molecules/RevokeReasonSelect';
 import { useCopy } from '@hooks/useCopy';
 import { getOrder, operateOrder, RevokeReason } from '@api/order';
 import type { Order, OrderAction } from '@api/types';
-import { FLAG_PULSE, FLAG_COLOR } from '@utils/constants';
+import { FLAG_PULSE, FLAG_COLOR, TRANSIENT_FLAGS } from '@utils/constants';
 import { downloadAsFile, shortenId } from '@utils/format';
 import CertInfo from './CertInfo';
 import DomainVerify from './DomainVerify';
@@ -33,16 +33,16 @@ export default function OrderPage() {
   const [operating, setOperating] = useState(false);
   const [actionTip, setActionTip] = useState('处理中，请稍候...');
 
-  const load = async () => {
+  const load = async (silent = false) => {
     if (!uuid) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const data = await getOrder(uuid);
       setOrder(data);
     } catch {
-      setOrder(null);
+      if (!silent) setOrder(null);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -50,6 +50,26 @@ export default function OrderPage() {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uuid]);
+
+  // 后端把 ACME 交互放到响应之后执行，状态由后台任务与 cron 推进，
+  // 因此处于中间态的订单需要轮询才能看到进度变化。
+  // 轮询有上限：后台任务若被截断，订单要等下一次 cron 才会变化，
+  // 无上限轮询只会持续消耗 D1 读取配额。超时后由用户手动刷新。
+  const flag = order ? Number(order.flag) : undefined;
+  const isProcessing = flag !== undefined && TRANSIENT_FLAGS.has(flag);
+  useEffect(() => {
+    if (!isProcessing) return;
+    let left = POLL_MAX_TICKS;
+    const timer = setInterval(() => {
+      if (--left <= 0) {
+        clearInterval(timer);
+        return;
+      }
+      load(true);
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isProcessing, uuid]);
 
   const handleAction = async (
     action: OrderAction,
@@ -205,7 +225,7 @@ export default function OrderPage() {
           <Button
             size="small"
             icon={<RefreshCw size={12} />}
-            onClick={load}
+            onClick={() => load()}
             loading={loading}
           >
             刷新
@@ -255,6 +275,10 @@ export default function OrderPage() {
     </PageShell>
   );
 }
+
+/* 轮询间隔与上限：约 6 分钟，略长于 cron 的 5 分钟兜底周期 */
+const POLL_INTERVAL_MS = 3000;
+const POLL_MAX_TICKS = 120;
 
 /* 动作对应的忙碌文案 */
 const ACTION_TIP: Record<string, string> = {

@@ -71,7 +71,7 @@ const STEPS = [
 
 export default function Apply() {
   const navigate = useNavigate();
-  const { message, modal } = App.useApp();
+  const { message } = App.useApp();
   const bootstrap = useBootstrapStore((s) => s.info);
   const [step, setStep] = useState(0);
   const [submitting, setSubmitting] = useState(false);
@@ -252,43 +252,12 @@ export default function Apply() {
         },
       };
 
-      const { uuid, warning } = await applyCert(
+      const { uuid } = await applyCert(
         payload,
         captchaEnabled ? captchaToken : undefined,
       );
-      if (warning) {
-        // 后端已创建订单，但 ACME 推进失败：用弹窗展示完整错误原因，确认后展示订单详情
-        modal.error({
-          title: '证书申请提交成功，但处理失败',
-          content: (
-            <div>
-              <div style={{ marginBottom: 8 }}>请根据以下错误原因调整并重新提交：</div>
-              <div
-                style={{
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                  fontFamily:
-                    'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                  fontSize: 12,
-                  padding: 10,
-                  borderRadius: 8,
-                  background: 'rgba(255, 77, 79, 0.08)',
-                  color: 'var(--text-1)',
-                  border: '1px solid rgba(255, 77, 79, 0.3)',
-                }}
-              >
-                {warning}
-              </div>
-            </div>
-          ),
-          okText: '查看订单',
-          onOk: () => navigate(`/order/${uuid}`),
-          width: 560,
-        });
-      } else {
-        message.success('申请提交成功 ✨');
-        setTimeout(() => navigate(`/order/${uuid}`), 600);
-      }
+      message.success('申请提交成功 ✨');
+      setTimeout(() => navigate(`/order/${uuid}`), 600);
     } catch (e: any) {
       message.error(e?.texts || e?.message || '申请失败');
     } finally {
