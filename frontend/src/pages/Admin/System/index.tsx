@@ -43,11 +43,20 @@ import {
   testCaptcha,
   testTelegram,
   testDcv,
+  testCa,
+  type CaSign,
 } from '@api/adminConfs';
 import { useBootstrapStore } from '@stores/useBootstrapStore';
 
 type Items = Record<string, any>;
 type Touched = Record<string, boolean>;
+
+/** 各家 CA 自检所依赖的配置项，用于提示「有未保存修改」 */
+const CA_TEST_KEYS: Record<CaSign, string[]> = {
+  'google-trust': ['GTS_keyMC', 'GTS_keyID', 'GTS_KeyTS'],
+  'zeroca-trust': ['ZRO_keyMC', 'ZRO_keyID', 'ZRO_KeyTS'],
+  'sslcom-trust': ['SSL_keyMC', 'SSL_keyID', 'SSL_KeyTS'],
+};
 
 /** 一个统一的"保存/回退"按钮组 */
 function ItemActions({
@@ -97,6 +106,74 @@ function toBool(v: any): boolean {
   return s === 'true' || s === '1' || s === 'yes' || s === 'on';
 }
 
+/** 自检结果列表：✓ 通过 / ✕ 失败 / ! 未能验证（既非通过也非失败） */
+function CheckList({
+  checks,
+}: {
+  checks: { name: string; ok: boolean; detail: string; warn?: boolean }[];
+}) {
+  if (checks.length === 0) return null;
+  return (
+    <div>
+      {checks.map((chk, i) => {
+        const color = !chk.ok ? '#ff4d4f' : chk.warn ? '#faad14' : '#52c41a';
+        return (
+          <div
+            key={i}
+            style={{
+              display: 'flex',
+              gap: 8,
+              alignItems: 'baseline',
+              fontSize: 12,
+              lineHeight: '20px',
+            }}
+          >
+            <span style={{ color }}>{!chk.ok ? '✕' : chk.warn ? '!' : '✓'}</span>
+            <span style={{ minWidth: 96 }}>{chk.name}</span>
+            <span style={{ color: 'rgba(0,0,0,0.65)' }}>{chk.detail}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** 单个 CA 的「验证配置」按钮与结果；deep 会注册账户以完整校验 EAB */
+function CaTestRow({
+  sign,
+  testing,
+  checks,
+  onTest,
+}: {
+  sign: CaSign;
+  testing: boolean;
+  checks: { name: string; ok: boolean; detail: string; warn?: boolean }[];
+  onTest: (sign: CaSign, deep?: boolean) => void;
+}) {
+  const [deep, setDeep] = useState(false);
+  return (
+    <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={8}>
+      <Space size={8} wrap>
+        <Button
+          size="small"
+          loading={testing}
+          onClick={() => onTest(sign, deep)}
+          icon={<SafetyCertificateOutlined />}
+        >
+          验证配置
+        </Button>
+        <Tooltip title="勾选后会注册 ACME 账户，从而完整校验 EAB。不消耗证书签发配额，但 GTS 的 EAB 为一次性凭据，注册后即失效。">
+          <Space size={4}>
+            <Switch size="small" checked={deep} onChange={setDeep} />
+            <Typography.Text style={{ fontSize: 12 }}>注册账户以完整校验 EAB</Typography.Text>
+          </Space>
+        </Tooltip>
+      </Space>
+      <CheckList checks={checks} />
+    </Space>
+  );
+}
+
 export default function AdminSystemPage() {
   const { message, modal } = AntdApp.useApp();
   const refreshBootstrap = useBootstrapStore((s) => s.refresh);
@@ -128,8 +205,14 @@ export default function AdminSystemPage() {
   // DCV 配置检查
   const [dcvTesting, setDcvTesting] = useState(false);
   const [dcvChecks, setDcvChecks] = useState<
-    { name: string; ok: boolean; detail: string }[]
+    { name: string; ok: boolean; detail: string; warn?: boolean }[]
   >([]);
+
+  // CA 凭据自检：按 CA 标识分别记录进行状态与结果
+  const [caTesting, setCaTesting] = useState<Record<string, boolean>>({});
+  const [caChecks, setCaChecks] = useState<
+    Record<string, { name: string; ok: boolean; detail: string; warn?: boolean }[]>
+  >({});
 
   const fetchAll = async () => {
     setLoading(true);
@@ -445,6 +528,34 @@ export default function AdminSystemPage() {
     }
   };
 
+  /**
+   * CA 凭据自检。
+   * 只读取已保存的配置：未保存的编辑不会生效，因此先提示用户。
+   */
+  const doCaTest = async (sign: CaSign, deep = false) => {
+    const relatedKeys = CA_TEST_KEYS[sign];
+    if (relatedKeys.some((k) => dirty[k])) {
+      message.warning('该 CA 有未保存的修改，自检读取的是已保存的配置，请先保存');
+    }
+    setCaTesting((s) => ({ ...s, [sign]: true }));
+    try {
+      const res: any = await testCa(sign, { deep });
+      setCaChecks((s) => ({ ...s, [sign]: res?.checks ?? [] }));
+      const warned = (res?.checks ?? []).some((x: any) => x.warn);
+      if (res?.flags === 0) {
+        if (warned) message.warning(res?.texts || '基本配置可用');
+        else message.success(res?.texts || '配置可用');
+      } else {
+        message.error(res?.texts || '配置存在问题');
+      }
+    } catch (e: any) {
+      setCaChecks((s) => ({ ...s, [sign]: e?.checks ?? [] }));
+      message.error(e?.texts || e?.message || '自检失败');
+    } finally {
+      setCaTesting((s) => ({ ...s, [sign]: false }));
+    }
+  };
+
   const doCaptchaTest = async () => {    if (!captchaToken.trim()) {
       message.error('请先在其它标签页获取一次验证码 token 并粘贴到此处');
       return;
@@ -633,28 +744,7 @@ export default function AdminSystemPage() {
           >
             检查 DCV 配置
           </Button>
-          {dcvChecks.length > 0 && (
-            <div>
-              {dcvChecks.map((chk, i) => (
-                <div
-                  key={i}
-                  style={{
-                    display: 'flex',
-                    gap: 8,
-                    alignItems: 'baseline',
-                    fontSize: 12,
-                    lineHeight: '20px',
-                  }}
-                >
-                  <span style={{ color: chk.ok ? '#52c41a' : '#ff4d4f' }}>
-                    {chk.ok ? '✓' : '✕'}
-                  </span>
-                  <span style={{ minWidth: 96 }}>{chk.name}</span>
-                  <span style={{ color: 'rgba(0,0,0,0.65)' }}>{chk.detail}</span>
-                </div>
-              ))}
-            </div>
-          )}
+          {dcvChecks.length > 0 && <CheckList checks={dcvChecks} />}
         </Space>
       </Card>
 
@@ -668,6 +758,11 @@ export default function AdminSystemPage() {
           </Typography.Text>
         }
       >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+          「验证配置」只探测账户凭据，不申请证书，不消耗签发配额。默认不注册账户；
+          GTS 的 EAB 为一次性凭据，注册账户后即失效，故仅在需要完整校验时勾选。
+        </Typography.Paragraph>
+
         <Typography.Title level={5} style={{ marginTop: 0 }}>
           Google Trust Services
         </Typography.Title>
@@ -677,6 +772,13 @@ export default function AdminSystemPage() {
         {renderText('GTS_KeyTS', 'GTS_KeyTS（账户私钥 PEM）', {
           textarea: true,
         })}
+        <CaTestRow
+          sign="google-trust"
+          testing={!!caTesting['google-trust']}
+          checks={caChecks['google-trust'] ?? []}
+          onTest={doCaTest}
+        />
+
         <Divider />
         <Typography.Title level={5}>SSL.com</Typography.Title>
         {renderBool('SSL_useIt', '启用 SSL.com')}
@@ -685,6 +787,13 @@ export default function AdminSystemPage() {
         {renderText('SSL_KeyTS', 'SSL_KeyTS（账户私钥 PEM）', {
           textarea: true,
         })}
+        <CaTestRow
+          sign="sslcom-trust"
+          testing={!!caTesting['sslcom-trust']}
+          checks={caChecks['sslcom-trust'] ?? []}
+          onTest={doCaTest}
+        />
+
         <Divider />
         <Typography.Title level={5}>ZeroSSL</Typography.Title>
         {renderBool('ZRO_useIt', '启用 ZeroSSL')}
@@ -693,6 +802,12 @@ export default function AdminSystemPage() {
         {renderText('ZRO_KeyTS', 'ZRO_KeyTS（账户私钥 PEM）', {
           textarea: true,
         })}
+        <CaTestRow
+          sign="zeroca-trust"
+          testing={!!caTesting['zeroca-trust']}
+          checks={caChecks['zeroca-trust'] ?? []}
+          onTest={doCaTest}
+        />
       </Card>
 
       {/* 防滥用 =================================================== */}

@@ -7,6 +7,8 @@
  *   DELETE /admin/confs/:name            删除配置项，回退到 env/默认值
  *   POST   /admin/confs/mail/test        Resend 空载测试
  *   POST   /admin/confs/captcha/test     验证码空载测试
+ *   POST   /admin/confs/dcv/test         Cloudflare DNS 代理自检
+ *   POST   /admin/confs/ca/test          CA 账户凭据自检（不消耗签发配额）
  *
  * 所有敏感 Secret（MAIL_KEYS / CERT_CAPTCHA_SECRET_KEY）不回显明文，
  * 只返回 `configured: boolean`。
@@ -383,6 +385,59 @@ export async function handleDcvTest(c: Context<AppEnv>): Promise<Response> {
     }, allOk ? 200 : 400);
 }
 
+/**
+ * POST /admin/confs/ca/test
+ * -------------------------------------------------------------------------
+ * 校验某家 CA 的账户凭据，不申请证书、不消耗签发配额。
+ * 请求体：{ sign: "google-trust" | "zeroca-trust" | "sslcom-trust",
+ *          deep?: boolean, type?: string }
+ * deep=true 会注册 ACME 账户以完整校验 EAB（GTS 的 EAB 为一次性，注册后失效）。
+ */
+export async function handleCaTest(c: Context<AppEnv>): Promise<Response> {
+    let body: any;
+    try {
+        body = await c.req.json();
+    } catch {
+        body = {};
+    }
+    const sign = String(body.sign ?? "").trim();
+    if (!sign) {
+        return c.json({flags: 4, texts: "请提供 sign", checks: []}, 400);
+    }
+    const {testCaCredentials, CA_TEST_META} = await import("../ca_test");
+    if (!CA_TEST_META[sign]) {
+        return c.json({flags: 4, texts: `不支持自检的证书提供商：${sign}`, checks: []}, 400);
+    }
+    try {
+        // 注册账户时的联系邮箱：取当前管理员邮箱
+        const admin: any = c.get("admin");
+        const contact = String(admin?.mail ?? "").trim();
+        const deep = body.deep === true;
+        // GTS 明确要求账户必须带 contact（实测报错 "Accounts must have at least one contact."），
+        // 缺失时提前给出可读提示，避免用户看到 CA 的原始英文报错。
+        if (deep && !contact) {
+            return c.json(
+                {flags: 4, texts: "当前管理员账号没有邮箱，无法注册 ACME 账户", checks: []},
+                400,
+            );
+        }
+        const result = await testCaCredentials(c.env as any, sign, {
+            deep,
+            contact,
+            type: typeof body.type === "string" ? body.type : undefined,
+        });
+        return c.json(
+            {flags: result.ok ? 0 : 9, texts: result.texts, checks: result.checks},
+            result.ok ? 200 : 400,
+        );
+    } catch (e: any) {
+        return c.json(
+            {flags: 7, texts: "自检失败：" + (e?.message ?? String(e)), checks: []},
+            500,
+        );
+    }
+}
+
 /** 挂载 */
 export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.use("/admin/confs", adminMiddleware);
@@ -394,6 +449,7 @@ export function mountAdminConfsRoutes(app: Hono<AppEnv>): void {
     app.post("/admin/confs/captcha/test", handleCaptchaTest);
     app.post("/admin/confs/telegram/test", handleTelegramTest);
     app.post("/admin/confs/dcv/test", handleDcvTest);
+    app.post("/admin/confs/ca/test", handleCaTest);
 }
 
 export const ADMIN_CONF_KEYS = ALLOWED_KEYS;

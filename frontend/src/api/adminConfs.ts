@@ -60,3 +60,23 @@ export interface DcvTestResp {
 export async function testDcv(): Promise<DcvTestResp> {
   return (await apiPost('/admin/confs/dcv/test', {})) as DcvTestResp;
 }
+
+/** 可自检的 CA 标识 */
+export type CaSign = 'google-trust' | 'zeroca-trust' | 'sslcom-trust';
+
+export interface CaTestResp {
+  flags: number;
+  texts?: string;
+  checks?: DcvCheck[];
+}
+
+/**
+ * 校验某家 CA 的账户凭据。不申请证书，因此不消耗签发配额。
+ * deep=true 会注册 ACME 账户以完整校验 EAB（GTS 的 EAB 为一次性，注册后失效）。
+ */
+export async function testCa(
+  sign: CaSign,
+  opts: { deep?: boolean; type?: string } = {},
+): Promise<CaTestResp> {
+  return (await apiPost('/admin/confs/ca/test', { sign, ...opts })) as CaTestResp;
+}
