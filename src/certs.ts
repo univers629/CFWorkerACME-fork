@@ -30,21 +30,43 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * 订单处理互斥集合。
+ * 订单处理互斥表。
  * -------------------------------------------------------------------------
  * cron 的 Processing() 与手动「立即处理」都可能推进同一订单，并发进入会
- * 重复生成私钥、重复提交 CSR。这里用模块级集合做同实例内的互斥。
- * 局限：Workers 多实例部署时无法跨实例互斥；ACME 侧对重复 CSR 提交本身
- * 是幂等的（同一订单只接受一次 finalize），因此该保护足以覆盖主要场景，
- * 且无需为分布式锁引入额外的表与迁移。
+ * 重复生成私钥、重复提交 CSR。这里用模块级 Map 做同实例内的互斥。
+ *
+ * 必须带过期时间（租约）而不是单纯 Set：
+ * 后台任务跑在 waitUntil 里，而 Cloudflare 只给响应后 30 秒 —— 一次 ACME
+ * 交互（directory + nonce + createOrder + 写 DNS）很容易超出该窗口，
+ * isolate 被掐断时 finally 不会执行。若锁没有租约，它会永久留在内存中，
+ * 导致之后「立即处理」和 cron 都被判为「正在处理」而直接跳过，
+ * 订单就永久卡在当前状态且没有任何提示。
+ *
+ * 租约到期后允许再次占用。ACME 侧对重复操作本身是幂等的
+ * （同一订单只接受一次 finalize），因此偶尔的重复推进是可接受的代价，
+ * 远优于永久卡死。
  */
-const _processing = new Set<string>();
+const _processing = new Map<string, number>();
 
-/** 尝试占用订单；返回释放函数，已被占用时返回 null */
-function acquireOrder(uuid: string): (() => void) | null {
-    if (_processing.has(uuid)) return null;
-    _processing.add(uuid);
-    return () => { _processing.delete(uuid); };
+/** 单次处理的最长占用时间；超过即视为上一次已被中断 */
+export const PROCESS_LEASE_MS = 120000;
+
+/**
+ * 尝试占用订单。
+ * @param now 当前时间戳（可注入，便于测试租约过期）
+ * @returns 释放函数；订单仍被未过期的租约占用时返回 null
+ */
+export function acquireOrder(uuid: string, now: number = Date.now()): (() => void) | null {
+    const held = _processing.get(uuid);
+    if (held !== undefined && now - held < PROCESS_LEASE_MS) return null;
+    if (held !== undefined) {
+        console.warn(`[certs] 订单 ${uuid} 的处理租约已过期（${now - held}ms），允许重新占用`);
+    }
+    _processing.set(uuid, now);
+    // 只有仍持有本次租约时才删除，避免把后来者的租约误删
+    return () => {
+        if (_processing.get(uuid) === now) _processing.delete(uuid);
+    };
 }
 
 /**
@@ -812,6 +834,15 @@ async function getStart(env: Bindings, order_user: any, order_info: any) {
         directoryUrl: acme_url,
         accountKey: acme_key_map[order_info.sign],
         externalAccountBinding: acme_eab_map[order_info.sign],
+        // 收紧轮询退避。acme-client 默认是 10 次、5s 起步、30s 封顶，
+        // 最坏情况 waitForValidStatus 会阻塞约 215 秒的退避（加上每次请求
+        // 自身耗时可达 245 秒）—— 远超 waitUntil 只给响应后 30 秒的窗口，
+        // 任务会被中途掐断（状态没写完、租约也没释放）。
+        // 这里压到约 12 秒退避：没等到 valid 就按「仍在校验」返回，
+        // 由下一轮 cron 继续，而不是把一次调用拖死。
+        backoffAttempts: 4,
+        backoffMin: 2000,
+        backoffMax: 6000,
     });
     try { // 获取账户信息 ================================
         client_data.getAccountUrl();
