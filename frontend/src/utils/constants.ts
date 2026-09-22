@@ -99,7 +99,9 @@ export const FLAG_PULSE: Record<
 export const AUTH_MAP: Record<string, string> = {
   'dns-self': 'TXT 手动验证',
   'web-self': 'WEB 手动验证',
-  'dns-auto': 'TXT 自动验证',
+  // dns-auto 实际创建的是 CNAME（指向 DCV_AGENT，CA 再到该目标读 TXT），
+  // 标签若写「TXT 自动验证」会与面板里显示的 CNAME 记录自相矛盾。
+  'dns-auto': 'CNAME 自动验证',
 };
 
 export const AUTH_OPTIONS = [

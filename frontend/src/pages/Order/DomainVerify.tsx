@@ -150,6 +150,12 @@ function DomainPanel({
                       mono
                     />
                   </div>
+                  {domain.type === 'dns-auto' && (
+                    <div className={styles.hint}>
+                      注意：该名称上不能同时存在 TXT 记录。同名 TXT 会遮蔽 CNAME，
+                      使 CA 读不到验证值并一直停在「验证中」；如有请先删除该 TXT。
+                    </div>
+                  )}
                 </>
               )}
 

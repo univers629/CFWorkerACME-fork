@@ -74,6 +74,8 @@ export interface DnsLookup {
     found: string[];
     /** 是否命中期望值 */
     matched: boolean;
+    /** 已知的失败原因（优先于通用的「值不一致」描述展示给用户） */
+    hint?: string;
 }
 
 /**
@@ -96,6 +98,7 @@ export async function lookupDNS(name: string, type: string, expect: string): Pro
 /** 把诊断结果转成简短的中文描述，供订单 text 字段展示 */
 export function describeLookup(l: DnsLookup): string {
     if (l.matched) return `${l.name} ${l.type} 记录正确`;
+    if (l.hint) return `${l.name}: ${l.hint}`;
     if (l.found.length === 0) {
         return `${l.name} 未查询到 ${l.type} 记录（期望 ${l.expect}）`;
     }

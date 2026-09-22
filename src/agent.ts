@@ -115,23 +115,32 @@ export async function dnsDel(env: Bindings, domain_name: string, domain_type: st
 /** 在所有候选 Zone 中查找同名同类型的全部记录 */
 async function findRecords(
     env: Bindings, domain_name: string, domain_type: string
-): Promise<{id: string; zoneId: string}[]> {
+): Promise<{id: string; zoneId: string; content?: string}[]> {
     const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
 
     // 候选 Zone：优先按域名匹配，匹配不到再退回全部
     const matched = await resolveZone(env, domain_name);
     const zones = matched ? [matched] : await listZones(env);
 
-    const hits: {id: string; zoneId: string}[] = [];
+    const hits: {id: string; zoneId: string; content?: string}[] = [];
     for (const z of zones) {
+        // 带上 name 让 Cloudflare 服务端先筛一遍：只靠 per_page=100 的首页结果，
+        // 记录较多的 Zone 会漏掉目标记录（删除/查重都会因此失效）。
+        const qs = new URLSearchParams({
+            per_page: "100",
+            type: domain_type,
+            name: domain_name,
+        });
         const page = await dnsAPI(
             "GET",
-            `https://api.cloudflare.com/client/v4/zones/${z.id}/dns_records?per_page=100&type=${encodeURIComponent(domain_type)}`,
+            `https://api.cloudflare.com/client/v4/zones/${z.id}/dns_records?${qs.toString()}`,
             cfAuthHeaders(email, token), undefined);
         const rows: any[] = Array.isArray(page?.result) ? page.result : [];
         for (const item of rows) {
             if (item?.name === domain_name && item?.type === domain_type) {
-                hits.push({id: String(item.id), zoneId: z.id});
+                // 顺带带回 content，供调用方判断该记录是否仍被其它订单引用，
+                // 避免为每条记录再发一次 GET。
+                hits.push({id: String(item.id), zoneId: z.id, content: String(item?.content ?? "")});
             }
         }
     }
@@ -148,10 +157,16 @@ async function findRecords(
  *   - 已存在同类型记录时不做任何修改，返回 unchanged；
  *   - 代理状态固定为关闭（DNS only），否则 ACME 服务器查不到 TXT；
  *   - Token 对该域名无编辑权限时返回失败原因，由调用方决定是否提示用户。
+ *
+ * 关于同名 TXT：DNS 规定同一名字上 CNAME 不能与其它记录共存。若历史上残留过
+ * `_acme-challenge.<域名>` 的 TXT（例如该域名曾用 dns-self 手动验证），解析器
+ * 会返回这条 TXT 而不再跟随 CNAME，CA 因此永远读不到 DCV_AGENT 上的值 ——
+ * 表现为「CNAME 看起来配好了，验证却一直卡在验证中」。所以这里在确认 CNAME
+ * 存在后，仍需清掉同名 TXT，否则 CNAME 形同虚设。
  */
 export async function cnameEnsure(
     env: Bindings, domain_name: string, target: string
-): Promise<{success: boolean; unchanged?: boolean; errors?: any[]}> {
+): Promise<{success: boolean; unchanged?: boolean; cleaned?: number; errors?: any[]}> {
     const host = String(domain_name ?? "").replace(/^\*\./, "").trim();
     const dest = String(target ?? "").trim();
     if (!host || !dest) {
@@ -164,10 +179,14 @@ export async function cnameEnsure(
         return {success: false, errors: [{message: `无法确定 ${host} 所属 Zone`}]};
     }
 
+    // 同名 TXT 会遮蔽 CNAME，必须先清掉。放在 CNAME 判断之前，
+    // 保证「CNAME 已存在」这条早退路径也不会漏掉清理。
+    const cleaned = await dropShadowingTxt(env, recordName);
+
     // 已存在则保持原样：用户可能已手工配置，不覆盖
     const existing = await findRecords(env, recordName, "CNAME");
     if (existing.length > 0) {
-        return {success: true, unchanged: true};
+        return {success: true, unchanged: true, cleaned};
     }
 
     const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
@@ -185,9 +204,68 @@ export async function cnameEnsure(
             ttl: 60,
             type: 'CNAME'
         }));
-    if (isIdenticalRecordError(res)) return {success: true, unchanged: true};
+    if (isIdenticalRecordError(res)) return {success: true, unchanged: true, cleaned};
     // dnsAPI 在异常时返回 {}，统一补齐 success 字段供调用方判断
-    return {success: !!res?.success, errors: res?.errors};
+    return {success: !!res?.success, cleaned, errors: res?.errors};
+}
+
+/**
+ * 删除 `_acme-challenge.<域名>` 上的 TXT 记录（同名 TXT 会遮蔽 CNAME）。
+ * 失败不抛错：清理属于 best-effort，删不掉时仍继续尝试创建 CNAME，
+ * 由后续的 DNS 预检把冲突明确报给用户。
+ * @param protect 需要保留的记录值（仍被其它活动订单引用）；由调用方计算后传入，
+ *                避免本模块依赖数据层，也便于单元测试直接构造场景。
+ * @returns 实际删除成功的条数
+ */
+async function dropShadowingTxt(
+    env: Bindings, recordName: string, protect: Set<string> = new Set()
+): Promise<number> {
+    try {
+        const rows = await findRecords(env, recordName, "TXT");
+        if (rows.length === 0) return 0;
+
+        const [email, token] = await Promise.all([dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN")]);
+        let removed = 0;
+        for (const r of rows) {
+            // 仍被其它活动订单引用的值：留给对应订单自行处理，不在此删除
+            const val = String(r.content ?? "").trim();
+            if (val && protect.has(val)) {
+                console.warn(`[agent] 保留仍被活动订单引用的 TXT ${recordName}: ${val}`);
+                continue;
+            }
+            const res = await dnsAPI(
+                "DELETE",
+                `https://api.cloudflare.com/client/v4/zones/${r.zoneId}/dns_records/${r.id}`,
+                cfAuthHeaders(email, token), undefined);
+            if (res?.success) removed++;
+            else console.warn(`[agent] 清理同名 TXT 失败 ${recordName} id=${r.id}:`, res?.errors);
+        }
+        if (removed > 0) {
+            console.warn(`[agent] 已清理 ${removed} 条遮蔽 CNAME 的 TXT 记录：${recordName}`);
+        }
+        return removed;
+    } catch (e) {
+        console.warn(`[agent] 清理同名 TXT 异常 ${recordName}:`, e);
+        return 0;
+    }
+}
+
+/**
+ * 自愈入口：清理某域名 `_acme-challenge` 上的同名 TXT。
+ * -------------------------------------------------------------------------
+ * 供 dnsAuthy 在验证失败时调用。必要性在于 cnameEnsure 只在 setApply（flag=1）
+ * 阶段执行一次，而历史订单可能早已越过该阶段 —— 若用户的旧订单曾被手工
+ * 添加过 `_acme-challenge` 的 TXT，那条记录会一直遮蔽 CNAME，订单每轮
+ * cron 都验证失败却无法自愈，除非用户手工删除。
+ * @param protect 需要保留的记录值，见 dropShadowingTxt
+ * @returns 删除成功的条数
+ */
+export async function healShadowingTxt(
+    env: Bindings, domain_name: string, protect: Set<string> = new Set()
+): Promise<number> {
+    const host = String(domain_name ?? "").replace(/^\*\./, "").trim();
+    if (!host) return 0;
+    return dropShadowingTxt(env, `_acme-challenge.${host}`, protect);
 }
 
 /** 列出所有 Zone 下的 DNS 记录（合并结果） */
