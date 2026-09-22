@@ -460,41 +460,14 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
         }
         console.log(domain_item.name, author_flag);
         if (!author_flag) { // 本地验证失败 ========================================================
-            // dns-auto 的失败常见于同名 TXT 遮蔽 CNAME（解析器不再跟随 CNAME，
-            // CA 读不到 DCV_AGENT 上的值）。cnameEnsure 只在 setApply 阶段跑过一次，
-            // 旧订单不会重跑，因此这里补一次自愈清理。
-            let cleaned = 0;
-            if (domain_item.type === "dns-auto") {
-                try {
-                    // 先算出必须保留的 TXT（同域名的 dns-self 活动订单可能正依赖它们），
-                    // 为 null 表示无法确认占用情况，此时放弃清理以免误删。
-                    const protect = await protectedTxtValues(dao, domain_item.name);
-                    if (protect !== null) {
-                        cleaned = await agent.healShadowingTxt(env, domain_item.name, protect);
-                    }
-                } catch (e) {
-                    console.warn(`[certs] 自愈清理同名 TXT 失败 ${domain_item.name}:`, e);
-                }
-            }
-            if (cleaned > 0) {
-                // 已清掉遮蔽记录：保持 flag=3 让下一轮 cron 自动重试。
-                // 不能落到 flag=2 —— 该状态在 opDomain(…, []) 下不会推进，
-                // 会把本可自动恢复的订单挂起，等用户手点「验证全部」。
-                domain_item.flag = 3;
-                status_flag = 3;
-                domain_fail.push(
-                    `${domain_item.name}: 已自动清理 ${cleaned} 条遮蔽 CNAME 的同名 TXT，稍后自动重试`
-                );
-            } else {
-                domain_item.flag = 2;
-                status_flag = 2
-                // 记录失败原因，供订单 text 字段展示
-                domain_fail.push(
-                    lookup
-                        ? `${domain_item.name}: ${query.describeLookup(lookup)}`
-                        : `${domain_item.name}: 未获取到 ACME 验证挑战`
-                );
-            }
+            domain_item.flag = 2;
+            status_flag = 2
+            // 记录失败原因，供订单 text 字段展示
+            domain_fail.push(
+                lookup
+                    ? `${domain_item.name}: ${query.describeLookup(lookup)}`
+                    : `${domain_item.name}: 未获取到 ACME 验证挑战`
+            );
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
             // challenge 的状态集合是 pending | processing | valid | invalid（RFC 8555 §7.1.6）。
@@ -907,67 +880,6 @@ async function getAuthy(client_data: any, orders_data: any) {
     return author_maps;
 }
 
-/**
- * 判定 dns-auto 模式下 `_acme-challenge.<域名>` 上的同名 TXT 是否构成遮蔽。
- * -------------------------------------------------------------------------
- * DNS 规定同一名字上 CNAME 不能与其它记录共存。若该名字上还有 TXT，
- * 解析器会返回这条 TXT 而不再跟随 CNAME，CA 因此读不到 DCV_AGENT 上的值。
- *
- * 但不能一见 TXT 就判失败：若该 TXT 恰好就是本次的验证值（用户可能手工
- * 把值填在了 `_acme-challenge` 上），CA 一样能验证通过，此时应视为成功。
- *
- * @param found 该名字上实际查到的 TXT 值
- * @param expected 本次验证期望的值
- * @returns clear=无 TXT；matched=有 TXT 且含期望值；shadowed=有 TXT 但不含期望值
- */
-export function shadowVerdict(found: string[], expected: string): "clear" | "matched" | "shadowed" {
-    if (!found || found.length === 0) return "clear";
-    return found.includes(String(expected ?? "")) ? "matched" : "shadowed";
-}
-
-/**
- * 计算自愈清理时必须保留的 TXT 值集合。
- * -------------------------------------------------------------------------
- * 自愈会删除 `_acme-challenge.<域名>` 上的同名 TXT，但 dns-self 订单的验证
- * 恰恰依赖用户手工放在该名字上的 TXT。若同域名存在另一张活动的 dns-self
- * 订单，直接删除会毁掉那张订单的验证，因此先把这些值收集起来。
- *
- * 只收集 dns-self 的 auth：dns-auto 的 auth 放在 `<hash>.<DCV_AGENT>` 上，
- * 本来就不在 `_acme-challenge.<域名>`，不应参与保护（否则会保护到自己的旧值）。
- *
- * @returns 受保护的值集合；读取订单失败时返回 null（调用方应放弃删除）
- */
-export async function protectedTxtValues(dao: any, host: string): Promise<Set<string> | null> {
-    const protect = new Set<string>();
-    const target = `_acme-challenge.${String(host ?? "").replace(/^\*\./, "").trim().toLowerCase()}`;
-    try {
-        const active: any = await dao.scanApplies({lte: {flag: 4}});
-        // scanApplies 可能返回数组或按 uuid 索引的对象，统一成可遍历的值集合
-        const rows: any[] = Array.isArray(active) ? active : Object.values(active ?? {});
-        for (const row of rows) {
-            // 只保护仍在进行中的订单：已完成(5)/失败(<0)的订单不再需要其记录
-            const flag = Number(row?.flag ?? -1);
-            if (flag < 0 || flag > 4) continue;
-            let list: any[];
-            try {
-                list = JSON.parse(row?.list ?? "[]");
-            } catch { continue; }
-            for (const d of list) {
-                if (String(d?.type ?? "") !== "dns-self") continue;
-                const name = String(d?.name ?? "").replace(/^\*\./, "").trim().toLowerCase();
-                if (!name || `_acme-challenge.${name}` !== target) continue;
-                const auth = String(d?.auth ?? "").trim();
-                if (auth) protect.add(auth);
-            }
-        }
-    } catch (e) {
-        // 无法确认占用情况时保守处理：宁可留着陈旧 TXT，也不误删他人记录
-        console.warn(`[certs] 读取活动订单失败，跳过 TXT 自愈清理 ${host}:`, e);
-        return null;
-    }
-    return protect;
-}
-
 async function dnsCheck(author_save: any, domain_item: any): Promise<query.DnsLookup | null> {
     if (author_save[domain_item.name] == undefined) return null;
     // 设置数据 =============================================
@@ -978,29 +890,8 @@ async function dnsCheck(author_save: any, domain_item: any): Promise<query.DnsLo
         domain_type = "CNAME" // 此时需检查CNAME而不是TXT记录
         author_text = domain_item.auto // 验证内容也改为CNAME
     } // 查询DNS ============================================
-    const name = "_acme-challenge." + domain_name;
-    // dns-auto 模式额外查一次 TXT，判定同名 TXT 是否遮蔽了 CNAME
-    if (domain_type === "CNAME") {
-        const shadow = await query.lookupDNS(name, "TXT", domain_item.auth);
-        const verdict = shadowVerdict(shadow.found, domain_item.auth);
-        if (verdict === "matched") {
-            // 同名 TXT 已包含验证值，CA 能验证通过
-            return {name, type: "TXT", expect: author_text, found: shadow.found, matched: true};
-        }
-        if (verdict === "shadowed") {
-            return {
-                name,
-                type: "TXT",
-                expect: `(无 TXT，仅保留 CNAME → ${author_text})`,
-                found: shadow.found,
-                matched: false,
-                hint: `存在 ${shadow.found.length} 条同名 TXT 记录，会遮蔽 CNAME 导致 CA 读不到验证值；` +
-                    `请删除这些 TXT 后重试（本系统会自动清理）`,
-            };
-        }
-    }
     // 返回完整诊断信息（期望值 + 实际值），使失败原因能展示给用户
-    return await query.lookupDNS(name, domain_type, author_text);
+    return await query.lookupDNS("_acme-challenge." + domain_name, domain_type, author_text);
 }
 
 async function dnsOrder(author_save: any, domain_item: any) {
