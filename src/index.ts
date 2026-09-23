@@ -481,7 +481,9 @@ app.use('/order/', async (c: Context): Promise<Response> => {
             } else if (order_acts === "re_new") {
                 await dao.updateApply(order_uuid, {flag: 0})
             } else if (order_acts === "rm_key") {
-                await dao.updateApply(order_uuid, {keys: ""})
+                // 一并清掉 pending_keys，否则 certs.healMissingKeys 会把私钥填回来，
+                // 使「清空后无法恢复」的承诺失效。
+                await dao.updateApply(order_uuid, {keys: "", pending_keys: ""})
             } else if (order_acts === "ca_del") {
                 // 吊销证书：支持通过 cd 参数传递 RFC5280 吊销原因码（数字 0/1/3/4/5 等）
                 let order_info = order_data[0];

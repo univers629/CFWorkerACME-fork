@@ -165,6 +165,10 @@ export async function handlePurgeCert(c: Context<AppEnv>): Promise<Response> {
     await dao.updateApply(uuid, {
         keys: "",
         cert: "",
+        // 一并清掉 pending_keys：该字段是签发过程中暂存的新私钥，
+        // 若留下，certs.healMissingKeys 会把 keys 重新填回去，
+        // 使这个「不可恢复」的操作被下一轮 cron 悄悄撤销。
+        pending_keys: "",
         text: appendText(row.text, `[admin:${admin.mail}] 已清除证书密钥与证书内容`),
     });
     return c.json({flags: 0, texts: "已清除 keys/cert，证书不再支持下载"});
