@@ -82,30 +82,58 @@ function isOrderExpired(orders_data: any): boolean {
     return Date.now() > ts;
 }
 
+/**
+ * 合并多域名场景下的订单状态，按严重程度取「最差」的那个。
+ * -------------------------------------------------------------------------
+ * 一张订单可含多个域名，每个域名各自给出状态。若直接逐个赋值，后面的
+ * 「已通过(4)」会覆盖前面的「本地未通过(2)」，订单就会带着未验证的域名
+ * 继续走到签发阶段。
+ *
+ * 优先级：-1（失败）> 2（本地未通过，需用户处理）> 3（校验中）> 4（已通过）
+ *
+ * @param cur 当前累计状态
+ * @param next 新域名给出的状态
+ */
+export function mergeStatusFlag(cur: number, next: number): number {
+    const rank = (f: number): number => {
+        if (f === -1) return 0;
+        if (f === 2) return 1;
+        if (f === 3) return 2;
+        if (f === 4) return 3;
+        return 4; // 未知状态视为最轻，不掩盖已知问题
+    };
+    return rank(next) < rank(cur) ? next : cur;
+}
+
 // challenge 校验结果判定 ==========================================================================
 /**
- * 把「等待 CA 校验」的结果映射为域名与订单的状态。
+ * 把 ACME challenge 的状态映射为域名与订单的状态。
  * -------------------------------------------------------------------------
  * 独立成纯函数的原因：这段判定曾因漏掉 processing 状态而让订单永久停在
  * 「申请中」并写下「域名验证通过」的错误文案，需要能被单元测试直接覆盖。
  *
- * @param waited valid=CA 确认通过；pending=仍在校验；error=等待过程抛错
- * @returns domainFlag 域名状态；statusFlag 订单状态（null 表示不改动）；
- *          retry 是否需要把「稍后重试」写入订单文案
+ * 设计约束（重要）：调用方跑在 waitUntil 里，只有响应后 30 秒，
+ * 因此这里**只做状态映射、绝不等待**。每个状态都必须在一次调用内
+ * 产生明确的下一步，否则订单会卡住：
+ *   - invalid    → 失败终态
+ *   - valid      → 该域名完成
+ *   - pending    → 本轮提交校验，下轮再查
+ *   - processing → CA 校验中，下轮再查
+ *
+ * @param chStatus ACME challenge 的 status 字段
+ * @returns domainFlag 域名状态；statusFlag 订单状态；submit 是否需提交校验
  */
-export function challengeOutcome(waited: "valid" | "pending" | "error"): {
+export function challengeOutcome(chStatus: string): {
     domainFlag: number;
-    statusFlag: number | null;
-    retry: boolean;
+    statusFlag: number;
+    submit: boolean;
 } {
-    if (waited === "valid") {
-        // 域名完成，订单状态保持不动：同一订单可能还有其它域名未验证，
-        // 由 status_flag 的初值（4）与其它域名的判定共同决定最终值。
-        return {domainFlag: 4, statusFlag: null, retry: false};
-    }
-    // pending / error 都必须把订单压回「验证中」，否则订单会带着未验证的
-    // 域名继续走到签发阶段。
-    return {domainFlag: 3, statusFlag: 3, retry: waited === "error"};
+    const s = String(chStatus ?? "").toLowerCase();
+    if (s === "invalid") return {domainFlag: -1, statusFlag: -1, submit: false};
+    if (s === "valid") return {domainFlag: 4, statusFlag: 4, submit: false};
+    if (s === "pending") return {domainFlag: 3, statusFlag: 3, submit: true};
+    // processing 及其它中间态：CA 正在校验，等下一轮
+    return {domainFlag: 3, statusFlag: 3, submit: false};
 }
 
 // 错误消息提取 ====================================================================================
@@ -204,6 +232,12 @@ export async function Processing(env: Bindings, ctx?: BackgroundContext) {
             if (order_info['flag'] == 2) result.push(await opDomain(env, order_user, order_info, []));// 等待用户配置 DNS 记录
             if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
             if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info, ctx));// 自动执行获取证书
+        } catch (e) {
+            // 单个订单出错不能中断整轮 cron：否则它后面的所有订单都被饿死
+            // （永远轮不到处理），且下一轮又会从同一个坏订单开始，形成长期阻塞。
+            // 这里只记录日志并继续，订单自身的状态由各阶段内部的 catch 负责落库。
+            console.error(`[certs] 订单 ${order_info['uuid']} 处理异常（继续处理其余订单）:`, e);
+            result.push({"uuid": order_info['uuid'], "texts": "处理异常: " + extractAcmeError(e)});
         } finally {
             release();
         }
@@ -483,7 +517,7 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
         console.log(domain_item.name, author_flag);
         if (!author_flag) { // 本地验证失败 ========================================================
             domain_item.flag = 2;
-            status_flag = 2
+            status_flag = mergeStatusFlag(status_flag, 2)
             // 记录失败原因，供订单 text 字段展示
             domain_fail.push(
                 lookup
@@ -492,47 +526,37 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             );
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
-            // challenge 的状态集合是 pending | processing | valid | invalid（RFC 8555 §7.1.6）。
-            // 旧实现只判断了 invalid / pending / valid，processing 会从三个分支中间漏过去：
-            // 既不标记完成也不标记失败，而 status_flag 仍为初值 4，于是订单被置为
-            // 「申请中」并写下「域名验证通过」—— 状态卡死且文案与事实相反。
-            let ch_status: string = String(author_data.data['status'] ?? "")
-            if (ch_status == "invalid") { // 已有验证失败
-                domain_item.flag = -1;
-                status_flag = -1;
-            } else if (ch_status == "valid") {
-                domain_item.flag = 4;
-            } else {
-                // pending：尚未提交，需要先 verifyChallenge / completeChallenge；
-                // processing：CA 已受理并在异步校验，只需等待。
-                let waited: "valid" | "pending" | "error" = "pending";
-                let waitErr: any = null;
+            // 关键约束：本函数跑在 waitUntil 里，而 Cloudflare 只给响应后 30 秒。
+            // 因此这里**不做任何等待** —— 每轮只推进一步，challenge 的最新状态
+            // 由下一轮开头的 getAuthy 重新拉取。
+            //
+            // 原实现在 Node 常驻进程里同步阻塞等待（waitForValidStatus 最坏 245s）
+            // 是安全的，但移植到 Workers 后必然被中途掐断：状态没写完、租约也
+            // 没释放，订单就卡死了。
+            //
+            // 也不再调用 verifyChallenge：它内部用 node:dns + 原版 axios 做本地
+            // DNS 复核，而本系统已用 DoH 做过等价校验（dnsCheck），那一步既冗余
+            // 又会引入自己的退避等待。
+            const ch_status: string = String(author_data.data['status'] ?? "")
+            const outcome = challengeOutcome(ch_status)
+            domain_item.flag = outcome.domainFlag
+            status_flag = mergeStatusFlag(status_flag, outcome.statusFlag)
+            if (outcome.submit) {
+                // 尚未提交：通知 CA 开始校验，本轮即结束，下轮看结果
                 try {
-                    if (ch_status == 'pending') {
-                        let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
-                        console.log('Domain Server Verify Status:', upload_flag);
-                        let submit_flag: any = await client_data.completeChallenge(author_data.data);
-                        console.log('Domain Remote Upload Status:', submit_flag['status']);
-                    }
-                    let result_flag = await client_data.waitForValidStatus(author_data.data);
-                    console.log('Domain Remote Verify Status:', result_flag['status']);
-                    waited = result_flag.status == "valid" ? "valid" : "pending";
+                    const submit_flag: any = await client_data.completeChallenge(author_data.data);
+                    console.log('Domain Remote Upload Status:', submit_flag?.['status']);
+                    domain_fail.push(`${domain_item.name}: 已提交 CA 校验，等待结果`);
                 } catch (error) {
-                    // waitForValidStatus 超时或网络异常时 CA 可能仍在校验，不能直接判失败。
-                    // 保留 flag=3 交由下一轮 cron 继续；若确实被 CA 判为 invalid，
-                    // 下一轮 getAuthy 会取回 invalid 状态并走上面的失败分支。
-                    console.log('Domain Remote Verify Errors:', error);
-                    waited = "error";
-                    waitErr = error;
-                }
-                const outcome = challengeOutcome(waited);
-                domain_item.flag = outcome.domainFlag;
-                if (outcome.statusFlag !== null) status_flag = outcome.statusFlag;
-                if (outcome.retry) {
+                    console.log('Domain Remote Submit Errors:', error);
+                    // 提交失败可能只是网络抖动，保留 flag=3 下轮重试；
+                    // 若确实被 CA 拒绝，下轮 getAuthy 会取回 invalid 并走失败分支。
                     domain_fail.push(
-                        `${domain_item.name}: 验证尚未完成（${extractAcmeError(waitErr)}），稍后自动重试`
+                        `${domain_item.name}: 提交校验失败（${extractAcmeError(error)}），稍后自动重试`
                     );
                 }
+            } else if (ch_status !== "valid" && ch_status !== "invalid") {
+                domain_fail.push(`${domain_item.name}: CA 校验中（${ch_status || "未知"}），稍后自动重试`);
             }
         }
         domain_save.push(domain_item);
@@ -834,12 +858,11 @@ async function getStart(env: Bindings, order_user: any, order_info: any) {
         directoryUrl: acme_url,
         accountKey: acme_key_map[order_info.sign],
         externalAccountBinding: acme_eab_map[order_info.sign],
-        // 收紧轮询退避。acme-client 默认是 10 次、5s 起步、30s 封顶，
-        // 最坏情况 waitForValidStatus 会阻塞约 215 秒的退避（加上每次请求
-        // 自身耗时可达 245 秒）—— 远超 waitUntil 只给响应后 30 秒的窗口，
-        // 任务会被中途掐断（状态没写完、租约也没释放）。
-        // 这里压到约 12 秒退避：没等到 valid 就按「仍在校验」返回，
-        // 由下一轮 cron 继续，而不是把一次调用拖死。
+        // 收紧退避：本进程只有响应后 30 秒预算，而 acme-client 默认允许
+        // 10 次重试、5s 起步、30s 封顶（最坏约 215 秒退避）。虽然现在已经
+        // 不再调用会长时间轮询的 waitForValidStatus，但 createAccount /
+        // createOrder 等签名请求仍会复用这套退避，一旦 CA 抖动就可能拖过窗口。
+        // 压到约 12 秒，失败就交给下一轮 cron，而不是把一次调用拖死。
         backoffAttempts: 4,
         backoffMin: 2000,
         backoffMax: 6000,
