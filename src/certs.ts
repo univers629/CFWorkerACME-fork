@@ -136,6 +136,34 @@ export function challengeOutcome(chStatus: string): {
     return {domainFlag: 3, statusFlag: 3, submit: false};
 }
 
+/** challenge 停在 processing 超过该时长后，主动重新 POST 一次催 CA 重查 */
+export const CHALLENGE_RESUBMIT_MS = 10 * 60 * 1000;
+
+/**
+ * 判断处于 processing 的 challenge 是否应重新提交。
+ * -------------------------------------------------------------------------
+ * RFC 8555 §8.2：服务端首次校验失败后按自己的退避计划重试，期间状态一直
+ * 是 processing，只有彻底放弃才转 invalid。**客户端可以重新 POST 一次
+ * challenge 来请求立即重试**，这正是 DNS 改好后该做的事。
+ *
+ * ZeroSSL（Sectigo）的退避可以很长 —— cert-manager #5690 记录其 Retry-After
+ * 可达 86400 秒。用户改完 DNS 后如果只是干等，订单会卡很久且毫无进展：
+ * 此前 processing 分支什么都不做，点多少次「立即处理」都只是把同一句
+ * 「CA 校验中」再写一遍。
+ *
+ * 判据用「本轮与上次提交的时间差」而不是固定轮次，避免 cron 频率变化后失效。
+ *
+ * @param lastSubmitAt 上次提交（或首次进入 processing）的时间戳；0/未记录视为需要提交
+ * @param now 当前时间戳
+ * @returns true 表示应重新 POST 触发 CA 重查
+ */
+export function shouldResubmitChallenge(
+    lastSubmitAt: number, now: number = Date.now()
+): boolean {
+    if (!Number.isFinite(lastSubmitAt) || lastSubmitAt <= 0) return true;
+    return now - lastSubmitAt >= CHALLENGE_RESUBMIT_MS;
+}
+
 // challenge 诊断信息提取 ==========================================================================
 /**
  * 从 ACME challenge 对象里抽出 CA 给出的失败原因。
@@ -723,11 +751,14 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             // CA 若已在 challenge 上写明失败原因，直接透出，不再让用户面对
             // 「稍后自动重试」这种无从下手的提示。
             const ch_reason = describeChallengeError(author_data.data)
+            // 上次提交（或首次进入 processing）的时间，用于判断是否该催 CA 重查
+            const lastSubmitAt = Number(domain_item['submit_at'] ?? 0)
             if (outcome.submit) {
                 // 尚未提交：通知 CA 开始校验，本轮即结束，下轮看结果
                 try {
                     const submit_flag: any = await client_data.completeChallenge(author_data.data);
                     console.log('Domain Remote Upload Status:', submit_flag?.['status']);
+                    domain_item['submit_at'] = Date.now()
                     domain_fail.push(`${domain_item.name}: 已提交 CA 校验，等待结果`);
                 } catch (error) {
                     console.log('Domain Remote Submit Errors:', error);
@@ -735,6 +766,35 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
                     // 若确实被 CA 拒绝，下轮 getAuthy 会取回 invalid 并走失败分支。
                     domain_fail.push(
                         `${domain_item.name}: 提交校验失败（${extractAcmeError(error)}），稍后自动重试`
+                    );
+                }
+            } else if (ch_status === "processing") {
+                // CA 正在按自己的退避计划重试，期间状态一直是 processing。
+                // 用户改完 DNS 后如果只是干等，可能等到 Retry-After 到期
+                // （ZeroSSL 可达数小时甚至 24 小时）才会有结果。
+                // RFC 8555 §8.2 允许客户端重新 POST 一次 challenge 请求立即
+                // 重查 —— 这正是 DNS 已修正时该做的事。
+                const authz_status = String(author_data.auth?.['status'] ?? "")
+                if (shouldResubmitChallenge(lastSubmitAt)) {
+                    try {
+                        const again: any = await client_data.completeChallenge(author_data.data);
+                        console.log('Domain Remote Resubmit Status:', again?.['status']);
+                        domain_item['submit_at'] = Date.now()
+                        domain_fail.push(
+                            `${domain_item.name}: CA 校验中，已请求立即重查（challenge=${String(again?.['status'] ?? ch_status)}）`
+                        );
+                    } catch (error) {
+                        // 部分 CA 对已受理的 challenge 再次 POST 会报错，属正常；
+                        // 记录时间避免每轮都重复请求。
+                        domain_item['submit_at'] = Date.now()
+                        console.log('Domain Remote Resubmit Errors:', error);
+                        domain_fail.push(
+                            `${domain_item.name}: CA 校验中（challenge=${ch_status}，授权=${authz_status || "未知"}），重新请求未受理（${extractAcmeError(error)}），稍后自动重试`
+                        );
+                    }
+                } else {
+                    domain_fail.push(
+                        `${domain_item.name}: ${ch_reason || describePendingReason(ch_status, authz_status)}`
                     );
                 }
             } else if (ch_status === "invalid") {
