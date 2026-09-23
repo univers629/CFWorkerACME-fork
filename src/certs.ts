@@ -136,6 +136,73 @@ export function challengeOutcome(chStatus: string): {
     return {domainFlag: 3, statusFlag: 3, submit: false};
 }
 
+// challenge 诊断信息提取 ==========================================================================
+/**
+ * 从 ACME challenge 对象里抽出 CA 给出的失败原因。
+ * -------------------------------------------------------------------------
+ * RFC 8555 §7.1.6：challenge 带有 `error` 字段（Problem Details 文档），
+ * CA 就是在这里说明「为什么校验没过」——例如 TXT 值不匹配、解析不到记录、
+ * CAA 拒绝等。此前代码只读 `status`，把 CA 已经给出的原因整段丢掉了，
+ * 用户看到的永远是「CA 校验中，稍后自动重试」，点多少次「立即处理」都
+ * 查不出所以然，只能靠外部 DNS 探测反推。
+ *
+ * 独立成纯函数以便单元测试直接覆盖（真实故障里 CA 的措辞五花八门）。
+ *
+ * @param ch ACME challenge 对象
+ * @returns 可读的原因文本；无可用信息时返回空串（调用方回退到默认文案）
+ */
+export function describeChallengeError(ch: any): string {
+    if (!ch || typeof ch !== "object") return "";
+    const err = ch['error'];
+    if (!err) return "";
+    // 少数 CA 直接把原因写成字符串
+    if (typeof err === "string") return err.trim();
+    if (typeof err !== "object") return String(err);
+
+    const detail = String(err['detail'] ?? "").trim();
+    const type = String(err['type'] ?? "").trim();
+    const subs: any[] = Array.isArray(err['subproblems']) ? err['subproblems'] : [];
+    const subText = subs
+        .map((s) => {
+            const id = s?.identifier?.value ? `[${s.identifier.value}] ` : "";
+            return id + String(s?.detail ?? s?.type ?? "").trim();
+        })
+        .filter(Boolean)
+        .join("; ");
+
+    const core = [detail, subText].filter(Boolean).join(" | ");
+    // ACME 的 type 是 urn:ietf:params:acme:error:xxx，保留末段更易读
+    const shortType = type ? type.replace(/^urn:ietf:params:acme:error:/, "") : "";
+    if (core && shortType) return `${core}（${shortType}）`;
+    if (core) return core;
+    if (shortType) return shortType;
+    // 结构未知时兜底序列化，至少不要把信息丢掉
+    try {
+        const s = JSON.stringify(err);
+        if (s && s !== "{}") return s;
+    } catch { /* ignore */ }
+    return "";
+}
+
+/**
+ * 描述「CA 尚未确认通过」时的可观测状态，供订单 text 展示。
+ * -------------------------------------------------------------------------
+ * 只报 challenge 的 status 不足以区分两种截然不同的情形：
+ *   - challenge=processing 且 authz=pending → CA 已受理，正在异步校验（正常等待）
+ *   - challenge=processing 且 authz=invalid → 校验其实已失败，只是状态未同步
+ * 因此把两者一起报出来，避免用户面对「稍后自动重试」却无从判断。
+ *
+ * @param chStatus challenge.status
+ * @param authzStatus authorization.status
+ */
+export function describePendingReason(chStatus: string, authzStatus: string): string {
+    const c = String(chStatus ?? "").trim() || "未知";
+    const a = String(authzStatus ?? "").trim();
+    return a
+        ? `CA 校验中（challenge=${c}，授权=${a}），稍后自动重试`
+        : `CA 校验中（challenge=${c}），稍后自动重试`;
+}
+
 // 错误消息提取 ====================================================================================
 // 针对 acme-client / xior 抛出的错误对象，优先抽取 ACME Problem Details 中的友好信息，
 // 方便写入订单 text 字段后展示给用户。
@@ -541,6 +608,9 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             const outcome = challengeOutcome(ch_status)
             domain_item.flag = outcome.domainFlag
             status_flag = mergeStatusFlag(status_flag, outcome.statusFlag)
+            // CA 若已在 challenge 上写明失败原因，直接透出，不再让用户面对
+            // 「稍后自动重试」这种无从下手的提示。
+            const ch_reason = describeChallengeError(author_data.data)
             if (outcome.submit) {
                 // 尚未提交：通知 CA 开始校验，本轮即结束，下轮看结果
                 try {
@@ -556,7 +626,12 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
                     );
                 }
             } else if (ch_status !== "valid" && ch_status !== "invalid") {
-                domain_fail.push(`${domain_item.name}: CA 校验中（${ch_status || "未知"}），稍后自动重试`);
+                // 优先报 CA 写明的失败原因；没有时退回报「谁在等谁」的状态组合，
+                // 至少能看出是正常校验中还是状态不同步。
+                const authz_status = String(author_data.auth?.['status'] ?? "")
+                domain_fail.push(ch_reason
+                    ? `${domain_item.name}: ${ch_reason}`
+                    : `${domain_item.name}: ${describePendingReason(ch_status, authz_status)}`);
             }
         }
         domain_save.push(domain_item);
@@ -625,15 +700,22 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
         return {"texts": "等待 CA 确认"};
     }
     if (orders_data.status == "invalid") {
+        // RFC 8555 §7.1.6：Order 对象同样带 error，写明为什么签发失败。
+        // 与 challenge.error 一样，这里此前只写「证书签发失败」，把原因丢了。
+        const order_reason = describeChallengeError(orders_data)
         await dao.updateApply(order_info['uuid'], {flag: -1})
-        await dao.updateApply(order_info['uuid'], {text: "证书签发失败"})
+        await dao.updateApply(order_info['uuid'], {
+            text: order_reason ? "证书签发失败：" + order_reason : "证书签发失败"
+        })
         // 通知（失败不抛异常，不影响主流程）
         await notify(env, {
             event: "fail",
             domains: await safeDomainNames(order_info),
             mail: order_info['mail'],
             uuid: order_info['uuid'],
-            detail: "ACME 侧返回 invalid，请检查域名解析或验证配置",
+            detail: order_reason
+                ? "ACME 侧返回 invalid：" + order_reason
+                : "ACME 侧返回 invalid，请检查域名解析或验证配置",
             siteHost: await siteHostOf(env),
         }, ctx);
         return {"texts": "验证状态无效"};
@@ -678,7 +760,12 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
     }
     if (orders_data.status === 'processing') {
         console.log('Orders Remote Finish Status:', "Certificate Processing");
-        await dao.updateApply(order_info['uuid'], {text: "证书正在等待完成签发"})
+        // 订单已进入 processing，但 CA 有时会在这里附上原因（如 CAA 拒绝），
+        // 有就透出，没有才是真正的「等待签发」。
+        const order_reason = describeChallengeError(orders_data)
+        await dao.updateApply(order_info['uuid'], {
+            text: order_reason ? "证书正在等待完成签发：" + order_reason : "证书正在等待完成签发"
+        })
     }
     if (orders_data.status === 'valid') {
         const certificate: any = await client_data.getCertificate(orders_data);// 获取证书
