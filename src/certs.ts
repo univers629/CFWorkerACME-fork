@@ -1188,10 +1188,15 @@ async function getAuthy(client_data: any, orders_data: any) {
  * @returns 链路诊断；未拿到挑战时返回 null
  */
 async function dnsCheck(author_save: any, domain_item: any): Promise<query.ChainLookup | null> {
-    if (author_save[domain_item.name] == undefined) return null;
+    const author = author_save[domain_item.name];
+    if (author == undefined) return null;
     const domain_name = String(domain_item.name).replaceAll("*.", "");
     const record = "_acme-challenge." + domain_name;
-    const expect = String(domain_item.auth ?? "");
+    // 期望值优先用本轮从 CA 取回的 keyAuthorization（author.text）：
+    // CA 就是拿它比对 DNS 的。订单里存的 auth 可能来自更早一轮 ——
+    // 订单重建 / challenge token 变更后旧值就失效了，拿它比对会误报
+    // 「值不匹配」，而 DNS 里其实已经是对的（或反之）。
+    const expect = String(author.text ?? domain_item.auth ?? "");
     // dns-auto：挑战名上应有一条指向 DCV_AGENT 的 CNAME，值在目标上
     // 其它模式（dns-self / web-self）：值直接写在挑战名上，不期望 CNAME
     const cnameExpect = domain_item.type == "dns-auto"

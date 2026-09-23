@@ -161,10 +161,10 @@ export interface ChainLookup {
 /**
  * 查询并校验完整验证链路（CNAME 指向 + 目标 TXT 值）。
  *
- * 遮蔽问题的成因：挑战名上若同时存在 CNAME 和 TXT，递归解析器在收到
- * TXT 查询时会直接返回那条 TXT，而**不会**再跟随 CNAME —— CA 因此读到
- * 错值。这里把这种情况单独识别出来（shadowed），因为它是自愈不了的，
- * 必须让用户删掉那些记录。
+ * 遮蔽（挑战名上另有同名 TXT）**不参与判定**，只作为线索记录：
+ * ACME 校验先查 CNAME、跟随到目标再查 TXT（acme-client 的
+ * walkDnsChallengeRecord 即如此），因此挑战名上的同名 TXT 通常不影响
+ * CA 取到正确值。曾把它当作失败条件，误伤了大量 CNAME 配置正确的订单。
  *
  * @param record 挑战记录名
  * @param expect 期望的 TXT 值
@@ -232,7 +232,10 @@ export function describeChain(l: ChainLookup): string {
         }
     }
     if (l.shadowed.length) {
-        parts.push(`${l.record} 上存在遮蔽 TXT（${l.shadowed.join(" / ")}），解析器会读到它们而不是 CNAME 目标，请删除这些记录`);
+        // 只作线索，不作结论：ACME 会先跟随 CNAME 再取 TXT，这些记录通常
+        // 不影响校验。此前文案写成「解析器会读到它们而不是 CNAME 目标」，
+        // 与「遮蔽不参与判定」的实现自相矛盾，也让用户白删了一轮记录。
+        parts.push(`${l.record} 上另有同名 TXT（${l.shadowed.join(" / ")}），非本系统写入；若验证仍失败可尝试删除，通常不影响校验`);
     }
     return parts.length ? parts.join("；") : `${l.record} 验证链路正常`;
 }
