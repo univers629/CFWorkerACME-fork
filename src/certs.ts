@@ -636,17 +636,18 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     let status_flag: number = 4;
     let domain_fail: string[] = [];
     for (let domain_item of JSON.parse(domain_list)) { // 验证DNS
-        // web-self（http-01验证）不需要DNS检查，直接提交验证
-        let lookup: query.DnsLookup | null = domain_item.type === "web-self"
-            ? null
-            : await dnsCheck(author_save, domain_item)
-        let author_flag: boolean = domain_item.type === "web-self"
-            ? (author_save[domain_item.name] != undefined)
-            : !!lookup?.matched
+        // 已有域名判定失败：订单已是终态，其余域名只需原样保留
         if (status_flag == -1) {
             domain_save.push(domain_item);
             continue
         }
+        // web-self（http-01验证）不需要DNS检查，直接提交验证
+        let lookup: query.ChainLookup | null = domain_item.type === "web-self"
+            ? null
+            : await dnsCheck(author_save, domain_item)
+        let author_flag: boolean = domain_item.type === "web-self"
+            ? (author_save[domain_item.name] != undefined)
+            : !!lookup?.ok
         console.log(domain_item.name, author_flag);
         if (!author_flag) { // 本地验证失败 ========================================================
             domain_item.flag = 2;
@@ -654,7 +655,7 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             // 记录失败原因，供订单 text 字段展示
             domain_fail.push(
                 lookup
-                    ? `${domain_item.name}: ${query.describeLookup(lookup)}`
+                    ? `${domain_item.name}: ${query.describeChain(lookup)}`
                     : `${domain_item.name}: 未获取到 ACME 验证挑战`
             );
         } else { // 本地验证成功 =====================================================================
@@ -667,9 +668,9 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             // 是安全的，但移植到 Workers 后必然被中途掐断：状态没写完、租约也
             // 没释放，订单就卡死了。
             //
-            // 也不再调用 verifyChallenge：它内部用 node:dns + 原版 axios 做本地
-            // DNS 复核，而本系统已用 DoH 做过等价校验（dnsCheck），那一步既冗余
-            // 又会引入自己的退避等待。
+            // 提交前的本地复核由上面的 dnsCheck 完成：它以 DoH 等价实现了
+            // acme-client verifyChallenge 的 CNAME 跟随 + TXT 值比对，
+            // 且是单次查询、不退避，适配这里的 30 秒预算。
             const ch_status: string = String(author_data.data['status'] ?? "")
             const outcome = challengeOutcome(ch_status)
             domain_item.flag = outcome.domainFlag
@@ -691,7 +692,19 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
                         `${domain_item.name}: 提交校验失败（${extractAcmeError(error)}），稍后自动重试`
                     );
                 }
-            } else if (ch_status !== "valid" && ch_status !== "invalid") {
+            } else if (ch_status === "invalid") {
+                // CA 判定校验失败。原实现只置 flag=-1 而不记录任何原因，
+                // 于是订单显示「域名验证失败:[]」—— 一个空数组，用户完全
+                // 无从下手。这里优先报 CA 写明的原因，CA 没写时用本地链路
+                // 诊断补上（哪一段断了、期望什么、实际什么）。
+                const authz_status = String(author_data.auth?.['status'] ?? "")
+                const detail = ch_reason
+                    || (lookup ? query.describeChain(lookup) : "")
+                    || (authz_status
+                        ? `CA 判定校验失败（授权=${authz_status}）`
+                        : "CA 判定校验失败，未给出具体原因");
+                domain_fail.push(`${domain_item.name}: ${detail}`);
+            } else if (ch_status !== "valid") {
                 // 优先报 CA 写明的失败原因；没有时退回报「谁在等谁」的状态组合，
                 // 至少能看出是正常校验中还是状态不同步。
                 const authz_status = String(author_data.auth?.['status'] ?? "")
@@ -707,8 +720,12 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     await dao.updateApply(order_info['uuid'], {data: JSON.stringify(orders_data)})
     await dao.updateApply(order_info['uuid'], {list: JSON.stringify(domain_save)})
     await dao.updateApply(order_info['uuid'], {flag: status_flag})
+    // 失败文案不再用 JSON.stringify：domain_fail 为空时会输出 `[]`，
+    // 界面上就是「域名验证失败:[]」，用户完全无从下手。
     if (status_flag == -1) await dao.updateApply(order_info['uuid'], {
-        text: "域名验证失败:" + JSON.stringify(domain_fail)
+        text: domain_fail.length
+            ? "域名验证失败：" + domain_fail.join("；")
+            : "域名验证失败，但未取得具体原因，请查看日志"
     })
     else if (status_flag == 2) await dao.updateApply(order_info['uuid'], {
         text: "域名验证未通过：" + domain_fail.join("；")
@@ -1087,18 +1104,32 @@ async function getAuthy(client_data: any, orders_data: any) {
     return author_maps;
 }
 
-async function dnsCheck(author_save: any, domain_item: any): Promise<query.DnsLookup | null> {
+/**
+ * 校验 DCV 的完整解析链路。
+ * -------------------------------------------------------------------------
+ * dns-01 需要两段都对：挑战名上的 CNAME 指向，以及 CNAME 目标上的 TXT 值。
+ * 此前只检查第一段（CNAME 是否存在），于是「指向对了但值是错的」这种情况
+ * 会被判为本地通过、直接提交给 CA，换回一个不带原因的 invalid。
+ *
+ * 原实现在提交前调用 acme-client 的 verifyChallenge 做这一步：它内部用
+ * node:dns 先跟随 CNAME 再比对 TXT。该实现依赖 node:dns 且自带退避重试，
+ * 不适合 Workers 的 30 秒预算，因此改为等价的 DoH 单次查询。
+ *
+ * @param author_save getAuthy 的结果，用于确认该域名确实拿到了挑战
+ * @param domain_item 订单中的域名条目
+ * @returns 链路诊断；未拿到挑战时返回 null
+ */
+async function dnsCheck(author_save: any, domain_item: any): Promise<query.ChainLookup | null> {
     if (author_save[domain_item.name] == undefined) return null;
-    // 设置数据 =============================================
-    let domain_name = domain_item.name.replaceAll("*.", "")
-    let author_text = domain_item.auth; // 目标解析记录
-    let domain_type = "TXT" // 待验证域名格式文本TXT
-    if (domain_item.type == "dns-auto") { // 如果DNS-AUTO模式
-        domain_type = "CNAME" // 此时需检查CNAME而不是TXT记录
-        author_text = domain_item.auto // 验证内容也改为CNAME
-    } // 查询DNS ============================================
-    // 返回完整诊断信息（期望值 + 实际值），使失败原因能展示给用户
-    return await query.lookupDNS("_acme-challenge." + domain_name, domain_type, author_text);
+    const domain_name = String(domain_item.name).replaceAll("*.", "");
+    const record = "_acme-challenge." + domain_name;
+    const expect = String(domain_item.auth ?? "");
+    // dns-auto：挑战名上应有一条指向 DCV_AGENT 的 CNAME，值在目标上
+    // 其它模式（dns-self / web-self）：值直接写在挑战名上，不期望 CNAME
+    const cnameExpect = domain_item.type == "dns-auto"
+        ? String(domain_item.auto ?? "").trim()
+        : "";
+    return await query.lookupChain(record, expect, cnameExpect);
 }
 
 async function dnsOrder(author_save: any, domain_item: any) {

@@ -36,10 +36,25 @@ export async function queryDNS( // =========================================
     return [];
 }
 
+/** DoH 的 TXT 值带双引号包裹（内部引号转义为 \"），而 CA 比对用的是去掉引号的原文 */
+function unquoteTxt(s: string): string {
+    let v = String(s ?? "");
+    if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+        v = v.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+    return v;
+}
+
+/** 查询类型名 → 资源记录类型号，用于过滤 DoH 应答 */
+const TYPE_NUM: Record<string, number> = {
+    A: 1, NS: 2, CNAME: 5, SOA: 6, MX: 15, TXT: 16, AAAA: 28,
+};
+
 /** 单个 DoH 解析器发起查询；任何异常都返回空数组 */
 async function queryOne(server: string, domain: string, record: string): Promise<DnsResponse[]> {
     // 查询参数设置 ========================================================
     const params = new URLSearchParams({name: domain, type: record}); // URL
+    const wantType = TYPE_NUM[String(record).toUpperCase()];
     try { // 查询过程 ======================================================
         const response = await fetch(`${server}?${params}`, {
             headers: {"accept": "application/dns-json"},
@@ -51,11 +66,21 @@ async function queryOne(server: string, domain: string, record: string): Promise
         } // 解析查询数据 ==================================================
         const data: any = await response.json();
         if (!data.Answer) return [];
-        return data.Answer.map( // 映射查询数据 ======
-            (r: any) => ({
-                name: r.name, type: r.type, time: r.TTL,
-                data: r.data.endsWith('.') ? r.data.substring(0, r.data.length - 1) : r.data,
-            }));
+        return data.Answer
+            // 只保留所问类型的记录：查 TXT 时若该名字只有 CNAME，解析器会在
+            // Answer 里回一条 CNAME 记录。不过滤的话它会被当成 TXT 值，
+            // 使「CNAME 正确、目标 TXT 正确」的健康链路被误判为失败。
+            .filter((r: any) => wantType === undefined || Number(r.type) === wantType)
+            .map( // 映射查询数据 ======
+            (r: any) => {
+                const raw = String(r.data ?? "");
+                // TXT 值需去掉 DoH 加的引号，才能与 keyAuthorization 比对；
+                // 其余类型去掉表示绝对名的尾点。
+                const value = wantType === TYPE_NUM.TXT
+                    ? unquoteTxt(raw)
+                    : (raw.endsWith('.') ? raw.substring(0, raw.length - 1) : raw);
+                return {name: r.name, type: r.type, time: r.TTL, data: value};
+            });
     } catch (error) {
         console.error(`解析数据失败 ${server}:`, error);
         return [];
@@ -100,6 +125,116 @@ export function describeLookup(l: DnsLookup): string {
         return `${l.name} 未查询到 ${l.type} 记录（期望 ${l.expect}）`;
     }
     return `${l.name} 的 ${l.type} 记录值为 ${l.found.join(" / ")}，与期望的 ${l.expect} 不一致`;
+}
+
+/**
+ * 完整 DCV 验证链路的诊断结果。
+ * -------------------------------------------------------------------------
+ * dns-01 的解析链路是两段：挑战名上的 CNAME，以及 CNAME 目标上的 TXT 值。
+ * 只检查第一段（CNAME 是否存在）是不够的 —— 那只能说明「指向配对了」，
+ * 说明不了「CA 能读到正确的值」。CA 读不到值时只会回一个不带原因的
+ * invalid，排查只能靠外部 DNS 探测。
+ */
+export interface ChainLookup {
+    /** 挑战记录名，如 _acme-challenge.example.com */
+    record: string;
+    /** 期望的 TXT 值（keyAuthorization） */
+    expect: string;
+    /** 期望的 CNAME 目标；dns-self 模式为空串（该模式不期望 CNAME） */
+    cnameExpect: string;
+    /** 实际解析到的 CNAME 目标；无 CNAME 时为空串 */
+    cnameFound: string;
+    /** CNAME 是否存在且指向期望目标（dns-self 模式恒为 true） */
+    cnameOk: boolean;
+    /** 挑战记录名上直接解析到的 TXT */
+    localTxt: string[];
+    /** CNAME 目标上解析到的 TXT */
+    targetTxt: string[];
+    /** 期望值是否出现在正确位置 */
+    txtOk: boolean;
+    /** CNAME 与 TXT 两段是否都通过（web-self 场景只看 TXT） */
+    ok: boolean;
+    /** 遮蔽记录：挑战名上存在、但不是期望值的 TXT */
+    shadowed: string[];
+}
+
+/**
+ * 查询并校验完整验证链路（CNAME 指向 + 目标 TXT 值）。
+ *
+ * 遮蔽问题的成因：挑战名上若同时存在 CNAME 和 TXT，递归解析器在收到
+ * TXT 查询时会直接返回那条 TXT，而**不会**再跟随 CNAME —— CA 因此读到
+ * 错值。这里把这种情况单独识别出来（shadowed），因为它是自愈不了的，
+ * 必须让用户删掉那些记录。
+ *
+ * @param record 挑战记录名
+ * @param expect 期望的 TXT 值
+ * @param cnameExpect 期望的 CNAME 目标；空串表示不校验 CNAME（dns-self）
+ */
+export async function lookupChain(
+    record: string, expect: string, cnameExpect: string = ""
+): Promise<ChainLookup> {
+    const want = String(expect ?? "");
+    const wantCname = String(cnameExpect ?? "").trim().replace(/\.$/, "");
+
+    const localTxt = (await queryDNS(record, "TXT"))
+        .map((r) => String(r.data ?? "")).filter(Boolean);
+
+    let cnameFound = "";
+    if (wantCname) {
+        const rows = await queryDNS(record, "CNAME");
+        cnameFound = rows.length ? String(rows[0].data ?? "").replace(/\.$/, "") : "";
+    }
+    const cnameOk = wantCname ? cnameFound === wantCname : true;
+
+    // 有 CNAME 时 CA 会跟随到目标取 TXT；只有目标上的值才算数
+    let targetTxt: string[] = [];
+    if (wantCname && cnameOk) {
+        targetTxt = (await queryDNS(wantCname, "TXT"))
+            .map((r) => String(r.data ?? "")).filter(Boolean);
+    }
+    const txtOk = wantCname
+        ? (cnameOk && targetTxt.includes(want))
+        : localTxt.includes(want);
+
+    // 仅 dns-auto 需要关注遮蔽：dns-self 本就允许多条 TXT 并存
+    const shadowed = wantCname ? localTxt.filter((v) => v !== want) : [];
+
+    // 遮蔽**不参与判定**，只作诊断提示。
+    // ACME 的解析顺序是先查 CNAME、跟随到目标再查 TXT（acme-client 的
+    // walkDnsChallengeRecord 即如此），因此挑战名上的同名 TXT 通常不会
+    // 影响 CA 取到正确的值。曾把它当作失败条件，结果误伤了大量 CNAME
+    // 配置完全正确的订单，已回滚 —— 这里不能重蹈覆辙。
+    const ok = cnameOk && txtOk;
+
+    return {
+        record, expect: want, cnameExpect: wantCname, cnameFound, cnameOk,
+        localTxt, targetTxt, txtOk, ok, shadowed,
+    };
+}
+
+/** 把链路诊断转成可操作的中文描述，供订单 text 字段展示 */
+export function describeChain(l: ChainLookup): string {
+    const parts: string[] = [];
+    if (!l.cnameOk) {
+        parts.push(l.cnameFound
+            ? `${l.record} 的 CNAME 指向 ${l.cnameFound}，期望 ${l.cnameExpect}`
+            : `${l.record} 未查询到指向 ${l.cnameExpect} 的 CNAME 记录`);
+    }
+    if (!l.txtOk) {
+        if (l.cnameExpect && l.cnameOk) {
+            parts.push(l.targetTxt.length
+                ? `${l.cnameExpect} 上的 TXT 值为 ${l.targetTxt.join(" / ")}，未包含期望的 ${l.expect}`
+                : `${l.cnameExpect} 上未查询到 TXT 记录（期望 ${l.expect}）`);
+        } else if (!l.cnameExpect) {
+            parts.push(l.localTxt.length
+                ? `${l.record} 的 TXT 值为 ${l.localTxt.join(" / ")}，未包含期望的 ${l.expect}`
+                : `${l.record} 未查询到 TXT 记录（期望 ${l.expect}）`);
+        }
+    }
+    if (l.shadowed.length) {
+        parts.push(`${l.record} 上存在遮蔽 TXT（${l.shadowed.join(" / ")}），解析器会读到它们而不是 CNAME 目标，请删除这些记录`);
+    }
+    return parts.length ? parts.join("；") : `${l.record} 验证链路正常`;
 }
 
 // 解析域名 ################################################################
