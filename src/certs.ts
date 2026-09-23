@@ -203,6 +203,48 @@ export function describePendingReason(chStatus: string, authzStatus: string): st
         : `CA 校验中（challenge=${c}），稍后自动重试`;
 }
 
+// 错误分类 ========================================================================================
+/**
+ * 判断一个 ACME 错误是否为「临时故障」（重试可能成功）。
+ * -------------------------------------------------------------------------
+ * 真实故障：ZeroSSL 返回 502 Bad Gateway（newNonce 端点），
+ * processOne 捕获后把订单直接置为 flag=-1「已失效」——用户点一次「立即处理」
+ * 就把一个本来能签下来的订单判死了，只能删掉重建。这是不可接受的：
+ * 网关抖动、限流、超时都不是「CA 拒绝了这个订单」。
+ *
+ * 判定原则：只有 CA **明确表态**（4xx 的 ACME 语义错误，或 challenge/order
+ * 被标为 invalid）才算永久失败；其余（5xx、429、408、网络层异常、超时）
+ * 一律视为临时，保留订单状态等下一轮 cron 重试。
+ *
+ * @param e 抛出的错误对象
+ * @returns true 表示可重试（调用方不应把订单置为终态失败）
+ */
+export function isTransientAcmeError(e: any): boolean {
+    if (!e) return false;
+    // 1) HTTP 状态码：5xx 网关/服务端故障、429 限流、408 请求超时均可重试
+    const status = Number(e?.response?.status ?? e?.config?.response?.status ?? e?.status ?? 0);
+    if (status >= 500 && status <= 599) return true;
+    if (status === 429 || status === 408) return true;
+
+    // 2) 明确的 ACME 语义错误 → 永久失败（CA 已表态，重试也没用）
+    const type = String(e?.response?.data?.type ?? e?.config?.response?.data?.type ?? "");
+    if (type.startsWith("urn:ietf:params:acme:error:")) return false;
+
+    // 3) 网络层 / 运行时异常：连接重置、DNS 失败、超时、Worker 主动中止
+    const code = String(e?.cause?.code ?? e?.code ?? "");
+    if (["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+         "EPIPE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) return true;
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") return true;
+    const msg = String(e?.message ?? "");
+    if (/timeout|timed out|network|fetch failed|socket hang up|aborted/i.test(msg)) return true;
+    // Cloudflare 网关错误码（如 `error code: 524`）
+    if (/error code:\s*(52[0-9]|530)/i.test(msg)) return true;
+
+    // 4) 无状态码、无 ACME 类型、无已知网络特征：保守视为永久失败，
+    //    避免把真正的问题（如凭据错误）无限重试下去。
+    return false;
+}
+
 // 错误消息提取 ====================================================================================
 // 针对 acme-client / xior 抛出的错误对象，优先抽取 ACME Problem Details 中的友好信息，
 // 方便写入订单 text 字段后展示给用户。
@@ -373,13 +415,28 @@ async function processOneLocked(env: Bindings, order_uuid: string, ctx?: Backgro
         } catch (e) {
             const msg = extractAcmeError(e);
             console.error("processOne error at flag=" + flag + ":", e);
-            // 将错误信息持久化到订单，供前端展示
-            try {
-                await dao.updateApply(order_uuid, {flag: -1, text: "处理失败: " + msg});
-            } catch (ue) {
-                console.error("processOne persist error failed:", ue);
+            if (isTransientAcmeError(e)) {
+                // 临时故障（网关 5xx、限流、超时、网络抖动）：**保留当前 flag**，
+                // 只把原因写进文案，等下一轮 cron 或用户再点一次「立即处理」重试。
+                // 此前这里无条件置 flag=-1，导致 ZeroSSL 一次 502 就把订单判成
+                // 「已失效」，用户只能删掉重建 —— 一个本可签下来的订单被白白作废。
+                try {
+                    await dao.updateApply(order_uuid, {
+                        text: "临时故障，稍后自动重试: " + msg
+                    });
+                } catch (ue) {
+                    console.error("processOne persist transient error failed:", ue);
+                }
+                result.push({"texts": "临时故障，稍后自动重试: " + msg});
+            } else {
+                // CA 明确拒绝（4xx ACME 语义错误等）：终态失败，不再重试
+                try {
+                    await dao.updateApply(order_uuid, {flag: -1, text: "处理失败: " + msg});
+                } catch (ue) {
+                    console.error("processOne persist error failed:", ue);
+                }
+                result.push({"texts": "处理失败: " + msg});
             }
-            result.push({"texts": "处理失败: " + msg});
             break;
         }
         // 若本轮处理后 flag 未推进，防止死循环
@@ -408,16 +465,25 @@ export async function newApply(env: Bindings, order_user: any, order_info: any) 
     } catch (e) {
         const msg = extractAcmeError(e);
         console.error("newApply createOrder failed:", e);
-        // 记录到订单：标记失败 + 写入明确错误原因，便于前端显示
+        // 临时故障（网关 5xx、限流、超时）不判死：保留 flag=0，等下一轮重试。
+        // 只有 CA 明确拒绝才写终态失败。
+        const transient = isTransientAcmeError(e);
         try {
-            await dao.updateApply(order_info['uuid'],
-                {flag: -1, text: "订单创建失败: " + msg});
+            await dao.updateApply(order_info['uuid'], transient
+                ? {text: "订单创建遇到临时故障，稍后自动重试: " + msg}
+                : {flag: -1, text: "订单创建失败: " + msg});
         } catch (ue) {
             console.error("newApply persist error failed:", ue);
         }
-        // 包装后再抛出，调用方（processOne）可直接使用
+        // 包装后再抛出，调用方（processOne）可直接使用。
+        // 必须把原始错误挂在 cause 上：processOne 要靠它判断是否临时故障，
+        // 只传 message 会丢掉 HTTP 状态码，分类就失效了。
         const wrapped: any = new Error(msg);
         wrapped.cause = e;
+        // 同时透传常见字段，避免调用方只能通过 cause 逐层取值
+        const rawErr: any = e;
+        wrapped.response = rawErr?.response ?? rawErr?.config?.response;
+        wrapped.status = rawErr?.response?.status ?? rawErr?.config?.response?.status ?? rawErr?.status;
         throw wrapped;
     }
     return {"texts": "处理成功"};

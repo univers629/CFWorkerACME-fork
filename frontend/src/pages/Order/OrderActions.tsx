@@ -43,6 +43,10 @@ export default function OrderActions({
   const isPending = order.flag >= 0 && order.flag < 5;
   const isVerifiable = order.flag === 2;
   const isSigned = order.flag === 5;
+  // flag=-1：订单被判定失败。此前这个状态下整个操作区都不渲染，
+  // 用户既不能重试也不能重新生成，只能删掉订单重建。
+  // 但失败可能是临时的（CA 网关 502 等），必须留一个重试入口。
+  const isFailed = order.flag === -1;
   const hasCert = !!order.cert;
   const hasKey = !!order.keys;
 
@@ -210,6 +214,41 @@ export default function OrderActions({
             }
           >
             吊销证书
+          </Button>
+          <Button
+            danger
+            size="large"
+            icon={<XCircle size={16} />}
+            loading={operating}
+            disabled={operating}
+            onClick={() =>
+              onAction('cancel', undefined, {
+                confirm: '确认删除此订单？所有相关信息将丢失',
+                danger: true,
+                requireConfirmId: order.uuid,
+              })
+            }
+          >
+            删除订单
+          </Button>
+        </>
+      )}
+
+      {isFailed && (
+        <>
+          <Button
+            type="primary"
+            size="large"
+            icon={<RotateCcw size={16} />}
+            loading={operating}
+            disabled={operating}
+            onClick={() =>
+              onAction('re_new', undefined, {
+                confirm: '确认重试此订单？将从创建订单开始重新走一遍签发流程',
+              })
+            }
+          >
+            重试申请
           </Button>
           <Button
             danger
