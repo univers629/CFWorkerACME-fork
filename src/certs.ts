@@ -322,8 +322,53 @@ export function extractAcmeError(e: any): string {
 }
 
 // 整体处理进程 ====================================================================================
+
+/**
+ * 修复「已签发但私钥没落库」的订单。
+ * -------------------------------------------------------------------------
+ * 成因：getCerts 的 ready 阶段把新私钥写入 pending_keys，随后**同一轮内**
+ * 轮询到 valid 并取回证书；但 valid 分支读的是函数入口时的内存快照
+ * order_info['pending_keys']，不含刚写入的值，于是只写了 cert、没写 keys。
+ * 订单因此显示「密钥：无」，且下载密钥 / ZIP / PFX、清空私钥、吊销等
+ * 依赖 keys 的按钮全部不可用。
+ *
+ * 好消息是私钥并没丢：pending_keys 字段仍保留着它，这里把它搬回 keys。
+ * 只处理 flag=5 且 keys 为空、pending_keys 非空的订单，不会覆盖已有私钥。
+ *
+ * @returns 修复的订单数量
+ */
+export async function healMissingKeys(env: Bindings): Promise<number> {
+    const dao = await ensureDao(env as any);
+    const signed: any = await dao.scanApplies({eq: {flag: 5}});
+    let healed = 0;
+    for (const id in signed) {
+        const row = signed[id];
+        const keys = row?.['keys'];
+        const pending = row?.['pending_keys'];
+        // 已有私钥的不动；没有待用私钥的无法修复（只能等下次续期重新生成）
+        if (typeof keys === "string" && keys.length > 0) continue;
+        if (typeof pending !== "string" || pending.length === 0) continue;
+        try {
+            // cert 与 keys 一次写入，避免出现只有其一的中间态
+            await dao.updateApply(row['uuid'], {keys: pending, pending_keys: ""});
+            healed += 1;
+            console.log(`[certs] 订单 ${row['uuid']} 私钥已从 pending_keys 恢复`);
+        } catch (e) {
+            console.error(`[certs] 恢复订单 ${row['uuid']} 私钥失败:`, e);
+        }
+    }
+    return healed;
+}
 export async function Processing(env: Bindings, ctx?: BackgroundContext) {
     const dao = await ensureDao(env as any);
+    // 先修复历史脏数据：已签发但私钥没落库的订单（见 healMissingKeys 注释）。
+    // 放在推进之前，这样修复后的订单同一次 tick 就能被正常处理。
+    try {
+        const healed = await healMissingKeys(env);
+        if (healed > 0) console.log(`[certs] 已修复 ${healed} 个缺少私钥的已签发订单`);
+    } catch (e) {
+        console.error("[certs] 修复缺少私钥的订单失败（继续处理其余订单）:", e);
+    }
     // flag <= 4 等价于「未签发或已失效」，且能命中 idx_apply_flag；
     // 原先的 flag != 5 无法使用索引，每次 cron 都是全表扫描。
     let order_list: any = await dao.scanApplies({lte: {flag: 4}});
@@ -816,14 +861,22 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
         // 新私钥先写入 pending_keys，不覆盖 keys：此时 cert 仍是上一张证书，
         // 直接覆盖会让库中出现「新私钥 + 旧证书」的组合。
         // 列不存在（迁移未执行）时退回旧行为，避免阻断签发。
+        let pendingKeysWritten = "";
         try {
-            await dao.updateApply(order_info['uuid'], {pending_keys: privateKeyBuff.toString()})
+            pendingKeysWritten = privateKeyBuff.toString();
+            await dao.updateApply(order_info['uuid'], {pending_keys: pendingKeysWritten})
         } catch (e) {
             console.warn(
                 `[certs] pending_keys 写入失败，回退为直接写 keys（uuid=${order_info['uuid']}）`, e
             );
+            pendingKeysWritten = "";
             await dao.updateApply(order_info['uuid'], {keys: privateKeyBuff.toString()})
         }
+        // 关键：同步内存快照。下面的轮询会让 ready→valid 在**同一轮内**完成，
+        // 而 valid 分支读的是 order_info['pending_keys'] —— 该对象是本函数入口
+        // 时取的快照，不含刚写入的私钥。不同步就会把新证书配上空私钥落库，
+        // 表现为「密钥：无」，且下载密钥/ZIP/PFX、清空私钥、吊销按钮全部不可用。
+        if (pendingKeysWritten) order_info['pending_keys'] = pendingKeysWritten;
         const finish_text: any = await client_data.finalizeOrder(orders_data, certificateCSR);// 最终确认订单
         console.log('Orders Remote Finish Status:', finish_text);
         await dao.updateApply(order_info['uuid'], {text: "证书签发请求提交成功"})
@@ -856,7 +909,20 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
         // cert 与 keys 必须**同一次写入**：只要二者不同步，下载端就可能拿到
         // 不匹配的一对。pending_keys 是本轮 ready 阶段生成的新私钥；
         // 若它缺失（老数据 / 异常中断）则保留原 keys，避免把私钥写没。
-        const pendingKeys = order_info['pending_keys'];
+        //
+        // 从数据库重读而不是用内存快照：ready 与 valid 现在可能在同一轮内
+        // 先后执行（见上面的轮询），而函数入口时的 order_info 不含刚写入的
+        // pending_keys。曾因此把新证书配上空私钥落库，订单显示「密钥：无」，
+        // 且下载密钥/ZIP/PFX、清空私钥、吊销按钮全部不可用。
+        let pendingKeys = order_info['pending_keys'];
+        try {
+            const fresh: any = await dao.getApply(order_info['uuid']);
+            if (fresh && typeof fresh['pending_keys'] === "string" && fresh['pending_keys'].length > 0) {
+                pendingKeys = fresh['pending_keys'];
+            }
+        } catch (e) {
+            console.warn(`[certs] 重读 pending_keys 失败，沿用内存快照 uuid=${order_info['uuid']}`, e);
+        }
         const hasPending = typeof pendingKeys === "string" && pendingKeys.length > 0;
         await dao.updateApply(
             order_info['uuid'],
@@ -869,6 +935,8 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any, 
                 `[certs] 订单 ${order_info['uuid']} 缺少 pending_keys，保留原私钥`
             );
         }
+        // 同步内存快照，供同一轮内后续逻辑与调用方使用
+        if (hasPending) order_info['keys'] = pendingKeys;
         await dao.updateApply(order_info['uuid'], {flag: 5})
         // 到期时间：优先用证书里真实的 notAfter（CA 不一定是 90 天，
         // 例如 ZeroSSL/Google 的策略会变），解析失败才回退到 +90 天。
