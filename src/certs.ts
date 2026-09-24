@@ -140,6 +140,56 @@ export function challengeOutcome(chStatus: string): {
 /** challenge 停在 processing 超过该时长后，主动重新 POST 一次催 CA 重查 */
 export const CHALLENGE_RESUBMIT_MS = 10 * 60 * 1000;
 
+/** 本地预检 http-01 挑战文件的超时（单次请求，不重试，适配 30 秒预算） */
+export const WEB_CHECK_TIMEOUT_MS = 8000;
+
+/**
+ * 从 ACME 授权对象里挑出该订单域名要用的 challenge。
+ * -------------------------------------------------------------------------
+ * 验证方式由用户在申请时选定，但 challenge 类型必须与之匹配：
+ * web-self 走 http-01，dns-auto / dns-self 走 dns-01。
+ *
+ * 此前本函数无条件优先 dns-01，于是 web-self 也会被提交 dns-01 —— 而
+ * setApply 对 web-self 不写任何 DNS 记录，CA 查不到 TXT，验证必然失败，
+ * 且失败信息里看不出是「选错了 challenge 类型」。
+ *
+ * 通配符授权只有 dns-01（CA 无法对 `*.example.com` 发 HTTP 请求），
+ * 此时按顺序回退到 dns-01，由调用方给出可读的诊断。
+ *
+ * @param challenges 授权对象的 challenges 数组
+ * @param domainType 订单里该域名的验证方式（web-self / dns-auto / dns-self）
+ * @returns 选中的 challenge；没有可用项时返回 undefined
+ */
+export function pickChallenge(challenges: any[], domainType: string): any | undefined {
+    const order = String(domainType) === "web-self"
+        ? ["http-01", "dns-01"]
+        : ["dns-01", "http-01"];
+    for (const want of order) {
+        const hit = (challenges ?? []).find((c: any) => c?.type === want);
+        if (hit) return hit;
+    }
+    return undefined;
+}
+
+/**
+ * 构造「订单域名 → 验证方式」映射，供 getAuthy 选择 challenge 类型。
+ * 键与 ACME 授权对象的 identifier 一致（通配符带 `*.` 前缀）。
+ */
+export function domainTypeMap(domain_list: string): Record<string, string> {
+    try {
+        const items = JSON.parse(domain_list ?? "[]");
+        if (!Array.isArray(items)) return {};
+        const map: Record<string, string> = {};
+        for (const it of items) {
+            const name = String(it?.name ?? "").trim();
+            if (name) map[name] = String(it?.type ?? "");
+        }
+        return map;
+    } catch {
+        return {};
+    }
+}
+
 /**
  * 判断处于 processing 的 challenge 是否应重新提交。
  * -------------------------------------------------------------------------
@@ -573,7 +623,8 @@ export async function setApply(env: Bindings, order_user: any, order_info: any) 
     let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
     // console.log(domain_list, orders_data);
     // 执行验证部分 ================================================================================
-    let author_save: Record<string, Record<string, any>> = await getAuthy(client_data, orders_data)
+    let author_save: Record<string, Record<string, any>> = await getAuthy(
+        client_data, orders_data, domainTypeMap(domain_list))
     let domain_save: any[] = []
     let domain_flag: number = 2
     let domain_text: string = ""
@@ -704,7 +755,8 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
     let orders_data: any = await client_data.getOrder(orders_text); // 获取授权信息
-    let author_save: Record<string, Record<string, any>> = await getAuthy(client_data, orders_data)
+    let author_save: Record<string, Record<string, any>> = await getAuthy(
+        client_data, orders_data, domainTypeMap(domain_list))
     // 验证所有域名 ================================================================================
     let domain_save: any[] = [] // 需要最后保存的域名详细验证数据
     let status_flag: number = 4;
@@ -715,12 +767,16 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             domain_save.push(domain_item);
             continue
         }
-        // web-self（http-01验证）不需要DNS检查，直接提交验证
+        // web-self 走 http-01：先本地取一次 token 文件，取不到就退回 flag=2。
+        // 其余方式校验 DNS 链路（CNAME 指向 + 目标 TXT 值）。
         let lookup: query.ChainLookup | null = domain_item.type === "web-self"
             ? null
             : await dnsCheck(author_save, domain_item)
+        let web: {ok: boolean; reason: string} | null = domain_item.type === "web-self"
+            ? await webCheck(author_save, domain_item)
+            : null
         let author_flag: boolean = domain_item.type === "web-self"
-            ? (author_save[domain_item.name] != undefined)
+            ? !!web?.ok
             : !!lookup?.ok
         console.log(domain_item.name, author_flag);
         if (!author_flag) { // 本地验证失败 ========================================================
@@ -728,9 +784,11 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             status_flag = mergeStatusFlag(status_flag, 2)
             // 记录失败原因，供订单 text 字段展示
             domain_fail.push(
-                lookup
-                    ? `${domain_item.name}: ${query.describeChain(lookup)}`
-                    : `${domain_item.name}: 未获取到 ACME 验证挑战`
+                web
+                    ? `${domain_item.name}: ${web.reason}`
+                    : lookup
+                        ? `${domain_item.name}: ${query.describeChain(lookup)}`
+                        : `${domain_item.name}: 未获取到 ACME 验证挑战`
             );
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
@@ -1202,7 +1260,15 @@ async function getStart(env: Bindings, order_user: any, order_info: any) {
 }
 
 // 获取验证数据 ####################################################################################
-async function getAuthy(client_data: any, orders_data: any) {
+/**
+ * 取回每个域名的 challenge，并按订单里选定的验证方式挑选类型。
+ *
+ * @param client_data acme-client 实例
+ * @param orders_data ACME 订单对象
+ * @param typeMap 域名 → 验证方式（web-self / dns-auto / dns-self）；
+ *                缺省时按 dns-01 优先处理，保持对旧订单的兼容
+ */
+async function getAuthy(client_data: any, orders_data: any, typeMap: Record<string, string> = {}) {
     let author_list: any[] = await client_data.getAuthorizations(orders_data);
     let author_maps: Record<string, any> = {}
     // console.log("author_list: ", author_list);
@@ -1212,28 +1278,12 @@ async function getAuthy(client_data: any, orders_data: any) {
         let author_name: string = author_info['value'];
         if (author_data['wildcard'] === true)
             author_name = "*." + author_name;
-        // let author_type: string = author_info['type'];
-        // 查找验证信息（优先dns-01，IP证书使用http-01）=================================
-        let author_save = undefined
-        // console.log(author_data)
-        for (const c of author_data['challenges']) {
-            if (c.type === "dns-01") {
-                author_save = c
-                break
-            }
-        }
-        // 如果没有dns-01（如IP证书），尝试http-01
-        if (author_save == undefined) {
-            for (const c of author_data['challenges']) {
-                if (c.type === "http-01") {
-                    author_save = c
-                    break
-                }
-            }
-        }
+        // 按订单选定的验证方式挑 challenge：web-self → http-01，其余 → dns-01。
+        // 通配符授权只有 dns-01，pickChallenge 会回退，由下方诊断说明原因。
+        const author_save = pickChallenge(author_data['challenges'], typeMap[author_name] ?? "");
         if (author_save == undefined) continue
         let author_text = await client_data.getChallengeKeyAuthorization(author_save)
-        console.log(author_text);
+        console.log(author_name, author_save['type'], author_text);
         // 返回结果 ========================================
         // console.log(author_name, author_type, author_save['token']);
         author_maps[author_name] = {
@@ -1277,6 +1327,74 @@ async function dnsCheck(author_save: any, domain_item: any): Promise<query.Chain
         ? String(domain_item.auto ?? "").trim()
         : "";
     return await query.lookupChain(record, expect, cnameExpect);
+}
+
+/**
+ * 本地预检 http-01 挑战文件。
+ * -------------------------------------------------------------------------
+ * 用户把 token 文件放到源站后，先自己取一次再提交给 CA：取不到就退回
+ * flag=2 并说明期望的路径与内容，避免把一个必然失败的挑战提交给 CA，
+ * 白白消耗一次失败计数（CA 失败后会换 token，用户还要重新放置）。
+ *
+ * 与 dnsCheck 一样只做单次请求、不退避，适配 Workers 的 30 秒预算。
+ *
+ * 独立成函数以便单元测试直接覆盖（stub globalThis.fetch 即可）。
+ *
+ * @param author_save getAuthy 的结果
+ * @param domain_item 订单中的域名条目
+ * @returns 通过与否 + 可读诊断
+ */
+export async function webCheck(
+    author_save: any, domain_item: any
+): Promise<{ok: boolean; reason: string}> {
+    const author = author_save[domain_item.name];
+    if (author == undefined) {
+        return {ok: false, reason: "未获取到 ACME 验证挑战"};
+    }
+    // 通配符授权只有 dns-01，CA 无法对 `*.example.com` 发 HTTP 请求。
+    // 这时选中的会是 dns-01，而 web-self 不写 DNS，必须明确告诉用户改方式。
+    if (String(author.data?.type) !== "http-01") {
+        return {
+            ok: false,
+            reason: `该域名只提供 ${String(author.data?.type ?? "未知")} 挑战，`
+                + "通配符域名无法使用 WEB 文件验证，请改用 DNS 自动验证",
+        };
+    }
+    const host = String(domain_item.name).replace(/^\*\./, "");
+    const token = String(author.data?.token ?? "");
+    const expect = String(author.text ?? "");
+    const url = `http://${host}/.well-known/acme-challenge/${token}`;
+    if (!token) return {ok: false, reason: `未取得 http-01 token（${host}）`};
+    let res: Response;
+    try {
+        res = await fetch(url, {
+            redirect: "follow",
+            signal: AbortSignal.timeout(WEB_CHECK_TIMEOUT_MS),
+        });
+    } catch (e) {
+        return {
+            ok: false,
+            reason: `无法访问 ${url}（${extractAcmeError(e)}）`,
+        };
+    }
+    if (!res.ok) {
+        return {ok: false, reason: `访问 ${url} 返回 HTTP ${res.status}`};
+    }
+    let body = "";
+    try {
+        body = (await res.text()).trim();
+    } catch {
+        return {ok: false, reason: `读取 ${url} 的响应失败`};
+    }
+    // CA 比对的是完整 keyAuthorization；这里同样要求包含，避免只放对
+    // token 而漏掉账户指纹这种「看起来放好了」的情况。
+    if (!body.includes(expect)) {
+        return {
+            ok: false,
+            reason: `${url} 的内容与期望不符（期望 ${expect}，实际 ${body.slice(0, 60)}）`,
+        };
+    }
+    return {ok: true, reason: ""};
 }
 
 async function dnsOrder(author_save: any, domain_item: any) {

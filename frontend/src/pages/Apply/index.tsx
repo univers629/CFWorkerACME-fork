@@ -202,6 +202,18 @@ export default function Apply() {
     }
     setSubmitting(true);
     try {
+      // 通配符 + WEB 文件验证：CA 无法对 `*.example.com` 发 HTTP 请求，
+      // 通配符授权只提供 dns-01，此组合必然失败，提交前直接拦下。
+      const badWild = state.domains.find(
+        (d) => !d.isIP && d.wildcard && d.verification === 'web-self'
+      );
+      if (badWild) {
+        message.error(
+          `${badWild.domain || '通配符域名'} 无法使用 WEB 文件验证，请改用 DNS 自动验证或关闭通配符`
+        );
+        setSubmitting(false);
+        return;
+      }
       // 组装 payload（统一去除空格 + 转小写，避免 ACME 服务端拒绝）
       const domainList: DomainItem[] = [];
       for (const d of state.domains) {

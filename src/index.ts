@@ -305,6 +305,18 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
         const dao = await ensureDao(c.env as any);
         const userRow = await dao.getUser(user_mail);
         if (!userRow) return c.json({flags: 4, texts: "用户不存在"}, 401);
+        // WEB 文件验证走 http-01，而 CA 无法对 `*.example.com` 发 HTTP 请求，
+        // 通配符授权只提供 dns-01。这种组合永远无法通过，在落库前就拒绝，
+        // 避免用户拿到一个必然失败的订单。
+        const badWildcard = domain_save.find(
+            (d: any) => d?.type === 'web-self' && String(d?.name ?? '').startsWith('*.')
+        );
+        if (badWildcard) {
+            return c.json({
+                flags: 10,
+                texts: `${badWildcard.name} 是通配符域名，无法使用 WEB 文件验证，请改用 DNS 自动验证或去掉通配符`,
+            }, 400);
+        }
         const {checkApplyGuard} = await import("./middleware/applyGuard");
         const guard = await checkApplyGuard(c, {
             source: "web",

@@ -168,6 +168,14 @@ export default function DomainSection({
                 className={styles.verifySeg}
                 block
               />
+              {d.wildcard && d.verification === 'web-self' && (
+                // http-01 需要 CA 访问 http://<域名>/.well-known/...，而
+                // `*.example.com` 不是可访问的主机名，CA 对通配符授权只提供
+                // dns-01。此组合必然失败，就地提示而不是等订单失败。
+                <div className={styles.warnHint}>
+                  通配符域名无法使用 WEB 文件验证，请改用 DNS 自动验证或关闭通配符
+                </div>
+              )}
             </motion.div>
           ))}
         </AnimatePresence>

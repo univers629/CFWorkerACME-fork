@@ -228,6 +228,19 @@
   font-family: var(--font-chinese);
 }
 
+/* 组合本身不成立（如通配符 + WEB 文件验证），提交前就会失败 */
+.warnHint {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: var(--font-chinese);
+  color: var(--warning, #b45309);
+  background: rgba(180, 83, 9, 0.08);
+  border: 1px solid rgba(180, 83, 9, 0.22);
+}
+
 /* ---------- 厂商卡片 ---------- */
 .caGrid {
   display: grid;
