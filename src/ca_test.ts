@@ -46,8 +46,19 @@ interface CaMeta {
     kidName: string;
     /** EAB HMAC Key 的配置名 */
     mcName: string;
-    /** SSL.com 的目录地址需要拼接密钥类型后缀 */
-    sslSuffix?: boolean;
+    /**
+     * 该 CA 按密钥类型拆分的目录后缀。
+     * ---------------------------------------------------------------------
+     * SSL.com 的 ACME 服务把 RSA 与 ECC 做成**两个独立的 ACME 配置**，
+     * 账户在其中一个配置下注册后，换到另一个配置访问会报
+     * `The account does not belong to the ACME configuration`。
+     * 也就是说同一把账户私钥无法同时用于两种算法 —— 必须分别注册。
+     *
+     * 此前探测写死 `rsa2048`，于是「注册账户」只在 rsa 端点建了账户，
+     * 用户随后提交 ECC 订单必然 401，而报错文案里还夹着一条误导性的 CAA
+     * 提示，极难定位。因此这里对每个端点分别探测、分别注册。
+     */
+    suffixes?: string[];
 }
 
 export const CA_TEST_META: Record<string, CaMeta> = {
@@ -71,9 +82,33 @@ export const CA_TEST_META: Record<string, CaMeta> = {
         keyName: "SSL_KeyTS",
         kidName: "SSL_keyID",
         mcName: "SSL_keyMC",
-        sslSuffix: true,
+        suffixes: ["rsa", "ecc"],
     },
 };
+
+/**
+ * 把订单的加密算法映射为 SSL.com 的目录后缀。
+ * 订单 type 取值：rsa2048 / eccp256 / eccp384 —— 取前 3 个字符即 rsa / ecc，
+ * 与 getStart 拼接目录时的做法一致。
+ */
+export function sslcomSuffixOf(type: string | undefined): string {
+    return String(type ?? "").substring(0, 3).toLowerCase();
+}
+
+/** SSL.com 报「账户不属于该 ACME 配置」时的特征串 */
+const ACCOUNT_WRONG_CONFIG = /does not belong to the ACME configuration/i;
+
+/** 判断错误是否为「账户注册在另一个 ACME 配置下」 */
+export function isWrongAcmeConfiguration(e: any): boolean {
+    const data = e?.response?.data;
+    const text = [
+        typeof data === "string" ? data : "",
+        String(data?.detail ?? ""),
+        String(data?.message ?? ""),
+        String(e?.message ?? ""),
+    ].join(" ");
+    return ACCOUNT_WRONG_CONFIG.test(text);
+}
 
 /** 从 ACME 错误对象里取出可读文案（RFC 8555 Problem Details 优先） */
 function pickAcmeError(e: any): string {
@@ -94,10 +129,140 @@ function acmeErrorType(e: any): string {
 }
 
 /**
+ * 探测单个目录端点：目录可达性 + nonce + EAB 校验。
+ *
+ * @returns probe 结果；registered 表示本次是否成功注册了账户
+ */
+async function probeEndpoint(
+    meta: CaMeta,
+    dirUrl: string,
+    keyPem: string,
+    kid: string,
+    hmacKey: string,
+    deep: boolean,
+    contact: string | undefined,
+): Promise<{ checks: CaCheck[]; fatal: boolean; registered: boolean }> {
+    const checks: CaCheck[] = [];
+    const client: any = new acme.Client({
+        directoryUrl: dirUrl,
+        accountKey: keyPem,
+        externalAccountBinding: {kid, hmacKey},
+    });
+
+    let accountExists = false;
+    try {
+        await client.api.apiResourceRequest(
+            "newAccount",
+            {onlyReturnExisting: true},
+            [200, 201],
+            {includeJwsKid: false, includeExternalAccountBinding: true},
+        );
+        accountExists = true;
+        checks.push({name: "ACME 目录", ok: true, detail: "目录可达，newNonce 正常"});
+        checks.push({name: "EAB 校验", ok: true, detail: "账户已注册且凭据有效"});
+    } catch (e: any) {
+        const type = acmeErrorType(e);
+        const wrongConfig = isWrongAcmeConfiguration(e);
+
+        // 账户属于另一个 ACME 配置（SSL.com 的 rsa/ecc 互斥）：
+        // 这既不是「凭据错误」也不是「目录不可达」，必须单独说明，
+        // 否则用户会照着 CAA 那条误导性提示白查一轮 DNS。
+        if (wrongConfig) {
+            checks.push({
+                name: "ACME 目录",
+                ok: true,
+                detail: "目录可达，newNonce 正常",
+            });
+            checks.push({
+                name: "EAB 校验",
+                ok: true,
+                detail: "凭据有效（账户注册在另一个配置下）",
+            });
+            checks.push({
+                name: "账户归属",
+                ok: false,
+                detail: "该账户已注册在另一个配置下，当前端点无法复用；"
+                    + "SSL.com 的 RSA 与 ECC 是两个独立配置，需分别注册",
+            });
+            return {checks, fatal: false, registered: false};
+        }
+
+        // badNonce：acme-client 内部会重试（默认 5 次），走到这里说明
+        // 重试已用尽，属服务端 nonce 抖动而非配置问题，不应据此判定失败。
+        if (type === "badNonce") {
+            checks.push({
+                name: "ACME 目录",
+                ok: true,
+                warn: true,
+                detail: "目录可达，但 nonce 校验反复失败（服务端抖动），请稍后重试",
+            });
+            return {checks, fatal: false, registered: false};
+        }
+
+        // 目录 / nonce 层面的失败：无法继续判断 EAB
+        if (type !== "accountDoesNotExist" && type !== "unauthorized" && type !== "malformed") {
+            checks.push({name: "ACME 目录", ok: false, detail: pickAcmeError(e)});
+            return {checks, fatal: true, registered: false};
+        }
+
+        checks.push({name: "ACME 目录", ok: true, detail: "目录可达，newNonce 正常"});
+
+        if (type === "unauthorized" || type === "malformed") {
+            // 凭据确实被 CA 校验并拒绝
+            checks.push({name: "EAB 校验", ok: false, detail: pickAcmeError(e)});
+            return {checks, fatal: true, registered: false};
+        }
+
+        // accountDoesNotExist：账户尚未注册
+        if (meta.suffixes) {
+            // 实测：SSL.com 在只读模式下也会校验 EAB，能走到这里说明 EAB 正确
+            checks.push({
+                name: "EAB 校验",
+                ok: true,
+                detail: "EAB 凭据有效；账户尚未注册，首次下单时会自动注册",
+            });
+        } else {
+            // 实测：GTS / ZeroSSL 忽略只读请求里的 EAB，无法据此判定
+            checks.push({
+                name: "EAB 校验",
+                ok: true,
+                warn: true,
+                detail: `该 CA 在只读模式下不校验 EAB，无法确认 ${meta.kidName} / ${meta.mcName} 是否正确`,
+            });
+            checks.push({
+                name: "账户状态",
+                ok: true,
+                warn: true,
+                detail: "尚未注册；如勾选「注册账户」可完整校验 EAB（不消耗证书签发配额）",
+            });
+        }
+    }
+
+    // 深度校验：注册账户（可选）
+    if (deep && !accountExists) {
+        try {
+            await client.createAccount({
+                termsOfServiceAgreed: true,
+                contact: contact ? [`mailto:${contact}`] : [],
+            });
+            checks.push({name: "注册账户", ok: true, detail: "注册成功"});
+            accountExists = true;
+            return {checks, fatal: false, registered: true};
+        } catch (e: any) {
+            checks.push({name: "注册账户", ok: false, detail: pickAcmeError(e)});
+            return {checks, fatal: true, registered: false};
+        }
+    }
+
+    return {checks, fatal: false, registered: false};
+}
+
+/**
  * 校验某家 CA 的账户凭据。
  *
  * @param deep 是否注册账户以完整校验 EAB（默认 false，只读）。
  *             注册账户不消耗证书签发配额，但会消耗 GTS 的一次性 EAB。
+ * @param type 订单的加密算法；SSL.com 按 rsa / ecc 拆分配置，需据此选择端点。
  */
 export async function testCaCredentials(
     env: any,
@@ -133,11 +298,10 @@ export async function testCaCredentials(
     checks.push({name: "凭据完整性", ok: true, detail: "三个字段均已配置"});
 
     // 2) 本地校验：账户私钥 PEM ------------------------------------
-    let client: any;
     try {
-        client = new acme.Client({directoryUrl: meta.url, accountKey: keyPem});
+        const c: any = new acme.Client({directoryUrl: meta.url, accountKey: keyPem});
         // getJwk 为纯本地解析，不发起网络请求
-        const jwk: any = client.http.getJwk();
+        const jwk: any = c.http.getJwk();
         const alg = jwk?.crv ? `EC ${jwk.crv}` : String(jwk?.kty ?? "未知");
         checks.push({name: "账户私钥", ok: true, detail: `PEM 解析正常（${alg}）`});
     } catch (e: any) {
@@ -162,103 +326,50 @@ export async function testCaCredentials(
     }
     checks.push({name: "HMAC Key", ok: true, detail: `base64 解码正常（${decoded.length} 字节）`});
 
-    // 4) 只读探针：目录可达 + nonce + EAB --------------------------
-    let dirUrl = meta.url;
-    if (meta.sslSuffix) {
-        const t = String(opts.type ?? "rsa2048");
-        dirUrl += t.substring(0, 3);
+    // 4) 只读探针 + 可选深度注册 -----------------------------------
+    // SSL.com：rsa 与 ecc 是两套独立配置，逐个探测。
+    // 订单用哪个算法，就落在哪个后缀上 —— 只探测其中一个会给出误导性结论。
+    const suffixes = meta.suffixes
+        ? (opts.type ? [sslcomSuffixOf(opts.type)] : meta.suffixes)
+        : [""];
+
+    let fatal = false;
+    let registeredAny = false;
+    const wrongConfigAt: string[] = [];
+
+    for (const suffix of suffixes) {
+        const dirUrl = meta.url + suffix;
+        const label = suffix ? `（${suffix.toUpperCase()}）` : "";
+        const r = await probeEndpoint(meta, dirUrl, keyPem, kid, hmacKey, !!opts.deep, opts.contact);
+        for (const c of r.checks) {
+            // 多端点时给检查项加上端点标识，避免两组结果混在一起看不出属于谁
+            checks.push(suffix ? {...c, name: `${c.name}${label}`} : c);
+        }
+        if (r.registered) registeredAny = true;
+        if (r.fatal) { fatal = true; break; }
+        if (r.checks.some((c) => c.name === "账户归属" && !c.ok)) wrongConfigAt.push(suffix);
     }
 
-    // 携带 EAB 的客户端（探针用）
-    client = new acme.Client({
-        directoryUrl: dirUrl,
-        accountKey: keyPem,
-        externalAccountBinding: {kid, hmacKey},
-    });
-
-    let accountExists = false;
-    try {
-        const resp: any = await client.api.apiResourceRequest(
-            "newAccount",
-            {onlyReturnExisting: true},
-            [200, 201],
-            {includeJwsKid: false, includeExternalAccountBinding: true},
-        );
-        accountExists = true;
-        checks.push({name: "ACME 目录", ok: true, detail: "目录可达，newNonce 正常"});
-        checks.push({
-            name: "EAB 校验",
-            ok: true,
-            detail: `账户已注册且凭据有效${resp?.headers?.location ? "" : ""}`,
-        });
-    } catch (e: any) {
-        const type = acmeErrorType(e);
-
-        // 目录 / nonce 层面的失败：无法继续判断 EAB
-        if (type !== "accountDoesNotExist" && type !== "unauthorized" && type !== "malformed") {
-            checks.push({name: "ACME 目录", ok: false, detail: pickAcmeError(e)});
-            return {ok: false, texts: `无法连接 ${meta.label} 的 ACME 目录`, checks};
-        }
-
-        checks.push({name: "ACME 目录", ok: true, detail: "目录可达，newNonce 正常"});
-
-        if (type === "unauthorized" || type === "malformed") {
-            // 凭据确实被 CA 校验并拒绝
-            checks.push({name: "EAB 校验", ok: false, detail: pickAcmeError(e)});
-            return {ok: false, texts: `${meta.label} 的 EAB 凭据无效`, checks};
-        }
-
-        // accountDoesNotExist：账户尚未注册
-        if (sign === "sslcom-trust") {
-            // 实测：SSL.com 在只读模式下也会校验 EAB，能走到这里说明 EAB 正确
-            checks.push({
-                name: "EAB 校验",
-                ok: true,
-                detail: "EAB 凭据有效；账户尚未注册，首次下单时会自动注册",
-            });
-        } else {
-            // 实测：GTS / ZeroSSL 忽略只读请求里的 EAB，无法据此判定
-            checks.push({
-                name: "EAB 校验",
-                ok: true,
-                warn: true,
-                detail: `该 CA 在只读模式下不校验 EAB，无法确认 ${meta.kidName} / ${meta.mcName} 是否正确`,
-            });
-            checks.push({
-                name: "账户状态",
-                ok: true,
-                warn: true,
-                detail: "尚未注册；如勾选「注册账户」可完整校验 EAB（不消耗证书签发配额）",
-            });
-        }
-    }
-
-    // 5) 深度校验：注册账户（可选） --------------------------------
-    if (opts.deep && !accountExists) {
-        try {
-            const created: any = await client.createAccount({
-                termsOfServiceAgreed: true,
-                contact: opts.contact ? [`mailto:${opts.contact}`] : [],
-            });
-            checks.push({
-                name: "注册账户",
-                ok: true,
-                detail: `注册成功${created?.headers?.location ? "，已获得 accountUrl" : ""}`,
-            });
-            accountExists = true;
-        } catch (e: any) {
-            checks.push({name: "注册账户", ok: false, detail: pickAcmeError(e)});
-            return {ok: false, texts: `${meta.label} 注册账户失败`, checks};
-        }
+    if (fatal) {
+        const bad = checks.find((c) => !c.ok);
+        return {ok: false, texts: `${meta.label} 配置存在问题`, checks: bad ? checks : checks};
     }
 
     const ok = checks.every((x) => x.ok);
     const warned = checks.some((x) => x.warn);
-    return {
-        ok,
-        texts: ok
-            ? (warned ? `${meta.label} 基本配置可用（EAB 未完全校验）` : `${meta.label} 配置可用`)
-            : `${meta.label} 配置存在问题`,
-        checks,
-    };
+    const conflict = wrongConfigAt.length > 0;
+
+    let texts: string;
+    if (!ok) {
+        texts = conflict
+            ? `${meta.label} 的账户已注册在另一个配置下，需换用对应算法或另配账户私钥`
+            : `${meta.label} 配置存在问题`;
+    } else if (warned) {
+        texts = `${meta.label} 基本配置可用（EAB 未完全校验）`;
+    } else if (registeredAny) {
+        texts = `${meta.label} 配置可用，已注册账户`;
+    } else {
+        texts = `${meta.label} 配置可用`;
+    }
+    return {ok, texts, checks};
 }

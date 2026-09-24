@@ -13,6 +13,7 @@ import {notify, type BackgroundContext} from "./notify";
 import {readConf} from "./db/conf";
 import {ensureDao} from "./db";
 import {parseCertValidity} from "./utils/certinfo";
+import {isWrongAcmeConfiguration} from "./ca_test";
 
 
 const acme_url_map: Record<string, any> = {
@@ -1179,6 +1180,19 @@ async function getStart(env: Bindings, order_user: any, order_info: any) {
                 console.error("Error message:", e.message);
             } else {
                 console.error("An unknown error occurred:", e);
+            }
+            // SSL.com 的 RSA 与 ECC 是两套独立 ACME 配置，同一把账户私钥
+            // 不能跨配置复用。CA 的原始报错里还夹着一条与本次失败无关的
+            // CAA 提示，照着它去查 DNS 会白费功夫，因此换成可操作的说明。
+            if (isWrongAcmeConfiguration(e)) {
+                const algo = order_info['type'] === "rsa2048" ? "RSA" : "ECC";
+                const err: any = new Error(
+                    `SSL.com 的账户已注册在另一个加密算法配置下，当前订单为 ${algo}，两者不通用。`
+                    + `请改用与账户一致的算法，或为 SSL.com 配置另一把账户私钥（SSL_KeyTS）。`
+                );
+                err.cause = e;
+                err.response = (e as any)?.response;
+                throw err;
             }
             throw e;
             // return null

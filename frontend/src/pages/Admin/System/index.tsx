@@ -21,6 +21,7 @@ import {
   Modal,
   Row,
   Radio,
+  Select,
   Space,
   Switch,
   Tag,
@@ -138,7 +139,14 @@ function CheckList({
   );
 }
 
-/** 单个 CA 的「验证配置」按钮与结果；deep 会注册账户以完整校验 EAB */
+/**
+ * 单个 CA 的「验证配置」按钮与结果。
+ * -------------------------------------------------------------------------
+ * deep 会注册账户以完整校验 EAB。
+ * SSL.com 额外提供算法选择：它的 RSA 与 ECC 是两套**独立**的 ACME 配置，
+ * 同一把账户私钥不能跨配置复用。因此必须按实际要用的算法来测，否则会出现
+ * 「测试通过、下单失败」。
+ */
 function CaTestRow({
   sign,
   testing,
@@ -148,20 +156,38 @@ function CaTestRow({
   sign: CaSign;
   testing: boolean;
   checks: { name: string; ok: boolean; detail: string; warn?: boolean }[];
-  onTest: (sign: CaSign, deep?: boolean) => void;
+  onTest: (sign: CaSign, deep?: boolean, type?: string) => void;
 }) {
   const [deep, setDeep] = useState(false);
+  // SSL.com 需要按算法分别验证；其它 CA 不区分端点
+  const needsAlgo = sign === 'sslcom-trust';
+  const [algo, setAlgo] = useState('eccp256');
   return (
     <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={8}>
       <Space size={8} wrap>
         <Button
           size="small"
           loading={testing}
-          onClick={() => onTest(sign, deep)}
+          onClick={() => onTest(sign, deep, needsAlgo ? algo : undefined)}
           icon={<SafetyCertificateOutlined />}
         >
           验证配置
         </Button>
+        {needsAlgo && (
+          <Tooltip title="SSL.com 的 RSA 与 ECC 是两套独立配置，同一把账户私钥不能跨配置复用。请选择你实际要签发的算法。">
+            <Select
+              size="small"
+              value={algo}
+              style={{ width: 130 }}
+              onChange={setAlgo}
+              options={[
+                { value: 'eccp256', label: 'ECC P256' },
+                { value: 'eccp384', label: 'ECC P384' },
+                { value: 'rsa2048', label: 'RSA 2048' },
+              ]}
+            />
+          </Tooltip>
+        )}
         <Tooltip title="勾选后会注册 ACME 账户，从而完整校验 EAB。不消耗证书签发配额，但 GTS 的 EAB 为一次性凭据，注册后即失效。">
           <Space size={4}>
             <Switch size="small" checked={deep} onChange={setDeep} />
@@ -532,14 +558,14 @@ export default function AdminSystemPage() {
    * CA 凭据自检。
    * 只读取已保存的配置：未保存的编辑不会生效，因此先提示用户。
    */
-  const doCaTest = async (sign: CaSign, deep = false) => {
+  const doCaTest = async (sign: CaSign, deep = false, type?: string) => {
     const relatedKeys = CA_TEST_KEYS[sign];
     if (relatedKeys.some((k) => dirty[k])) {
       message.warning('该 CA 有未保存的修改，自检读取的是已保存的配置，请先保存');
     }
     setCaTesting((s) => ({ ...s, [sign]: true }));
     try {
-      const res: any = await testCa(sign, { deep });
+      const res: any = await testCa(sign, { deep, type });
       setCaChecks((s) => ({ ...s, [sign]: res?.checks ?? [] }));
       const warned = (res?.checks ?? []).some((x: any) => x.warn);
       if (res?.flags === 0) {
